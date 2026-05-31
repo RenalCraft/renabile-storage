@@ -6,9 +6,16 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 // Безопасно подтягиваем DATABASE_URL из Environment Variables Рендера
+let rawUrl = process.env.DATABASE_URL || "";
+
+// Конвертируем формат JDBC (Java) в стандартный формат подключения для Node.js (postgres://)
+if (rawUrl.startsWith("jdbc:postgresql://")) {
+    rawUrl = rawUrl.replace("jdbc:postgresql://", "postgres://");
+}
+
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL ? process.env.DATABASE_URL.replace("jdbc:postgresql://", "postgres://") : "",
-                      ssl: { rejectUnauthorized: false }
+    connectionString: rawUrl,
+    ssl: { rejectUnauthorized: false }
 });
 
 // Инициализация таблицы сообщений для сохранения истории чатов
@@ -20,7 +27,7 @@ CREATE TABLE IF NOT EXISTS chat_history (
                                          message TEXT,
                                          ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-`).then(() => console.log("[DB] Таблица истории чатов проверена/создана."));
+`).then(() => console.log("[DB] Таблица истории чатов успешно проверена/создана."));
 
 // 1. ПОЛУЧЕНИЕ АВАТАРКИ
 app.get('/api/avatar/:username', async (req, res) => {
@@ -45,7 +52,7 @@ app.get('/api/avatar/:username', async (req, res) => {
     }
 });
 
-// 2. ЗАГРУЗКА/ОБНОВЛЕНИЕ АВАТАРКИ (HTTP POST вместо перегрузки веб-сокета)
+// 2. ЗАГРУЗКА/ОБНОВЛЕНИЕ АВАТАРКИ (через HTTP POST вместо перегрузки веб-сокета)
 app.post('/api/avatar/upload', async (req, res) => {
     const { username, avatar } = req.body;
     try {
@@ -58,12 +65,12 @@ app.post('/api/avatar/upload', async (req, res) => {
 
 // 3. ПОЛУЧЕНИЕ ИСТОРИИ ПЕРЕПИСКИ
 app.get('/api/history', async (req, res) => {
-    const { u1, u2 } = req.query; // u2 может быть 'GLOBAL' или кодом друга
+    const { u1, u2 } = req.query; // u1 - мой логин, u2 может быть 'GLOBAL' или кодом/логином друга
     try {
         let result;
         if (u2 === 'GLOBAL') {
             result = await pool.query(
-                'SELECT sender, message as text FROM chat_history WHERE recipient = \'GLOBAL\' ORDER BY ts ASC LIMIT 50'
+                "SELECT sender, message as text FROM chat_history WHERE recipient = 'GLOBAL' ORDER BY ts ASC LIMIT 50"
             );
         } else {
             result = await pool.query(
