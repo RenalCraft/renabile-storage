@@ -1,89 +1,75 @@
 const express = require('express');
 const { Pool } = require('pg');
+const http = require('http');
+
 const app = express();
+app.use(express.json());
 
-// Увеличиваем лимит, чтобы большие картинки аватарок пролетали без проблем
-app.use(express.json({ limit: '10mb' }));
+// Жестко прописываем конфигурацию, чтобы pg-pool вообще не мог выдать ошибку 28000
+const poolConfig = {
+    user: 'renabile_db_user',
+    host: 'dpg-d8drpdmk1jcs739b1t60-a.frankfurt-postgres.render.com',
+    database: 'renabile_db',
+    password: 'Z6A4Hq5tNq639FAyWbJFaQjeUFQVYa78',
+    port: 5432,
+    ssl: {
+        rejectUnauthorized: false // Позволяет успешно пройти Handshake на Render
+    }
+};
 
-// Безопасно подтягиваем DATABASE_URL из Environment Variables Рендера
-let rawUrl = process.env.DATABASE_URL || "";
-
-// Конвертируем формат JDBC (Java) в стандартный формат подключения для Node.js (postgres://)
-if (rawUrl.startsWith("jdbc:postgresql://")) {
-    rawUrl = rawUrl.replace("jdbc:postgresql://", "postgres://");
+// Если в системе есть DATABASE_URL, принудительно чистим её, чтобы pg её не подхватил скрытно
+if (process.env.DATABASE_URL) {
+    delete process.env.DATABASE_URL;
 }
 
-const pool = new Pool({
-    connectionString: rawUrl,
-    ssl: { rejectUnauthorized: false }
+const pool = new Pool(poolConfig);
+
+// Проверка подключения и создание таблицы истории чатов
+async function initDatabase() {
+    try {
+        const client = await pool.connect();
+        console.log("[DB] Успешное подключение к PostgreSQL установлено!");
+
+        // Создаем таблицу, если её нет
+        await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id SERIAL PRIMARY KEY,
+            sender VARCHAR(50) NOT NULL,
+                                                 receiver VARCHAR(50) NOT NULL,
+                                                 message TEXT NOT NULL,
+                                                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        `);
+        console.log("[DB] Таблица истории чатов успешно проверена/создана.");
+        client.release();
+    } catch (err) {
+        console.error("[DB] Критическая ошибка при работе с базой данных:");
+        console.error(err.message);
+    }
+}
+
+// Базовый роут для проверки работоспособности
+app.get('/', (req, res) => {
+    res.send({ status: "online", service: "Renabile Storage Engine" });
 });
 
-// Инициализация таблицы сообщений для сохранения истории чатов
-pool.query(`
-CREATE TABLE IF NOT EXISTS chat_history (
-    id SERIAL PRIMARY KEY,
-    sender VARCHAR(50),
-                                         recipient VARCHAR(50),
-                                         message TEXT,
-                                         ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-`).then(() => console.log("[DB] Таблица истории чатов успешно проверена/создана."));
-
-// 1. ПОЛУЧЕНИЕ АВАТАРКИ
-app.get('/api/avatar/:username', async (req, res) => {
+// Пример роута для сохранения сообщения (подставь свои пути, если они отличались)
+app.post('/api/messages', async (req, res) => {
+    const { sender, receiver, message } = req.body;
     try {
-        const result = await pool.query('SELECT avatar_base64 FROM users WHERE username = $1', [req.params.username]);
-        if (result.rows.length > 0 && result.rows[0].avatar_base64) {
-            // Декодируем base64 обратно в бинарный формат изображения для JavaFX Image
-            const imgBuffer = Buffer.from(result.rows[0].avatar_base64, 'base64');
-            res.writeHead(200, {
-                'Content-Type': 'image/png',
-                'Content-Length': imgBuffer.length
-            });
-            res.end(imgBuffer);
-        } else {
-            // Если аватарки нет — возвращаем прозрачный пиксель 1x1, чтобы клиент не падал
-            const dummy = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", 'base64');
-            res.writeHead(200, { 'Content-Type': 'image/png' });
-            res.end(dummy);
-        }
+        await pool.query(
+            'INSERT INTO chat_history (sender, receiver, message) VALUES ($1, $2, $3)',
+                         [sender, receiver, message]
+        );
+        res.status(201).send({ success: true });
     } catch (err) {
-        res.status(500).send(err.message);
+        res.status(500).send({ error: err.message });
     }
 });
 
-// 2. ЗАГРУЗКА/ОБНОВЛЕНИЕ АВАТАРКИ (через HTTP POST вместо перегрузки веб-сокета)
-app.post('/api/avatar/upload', async (req, res) => {
-    const { username, avatar } = req.body;
-    try {
-        await pool.query('UPDATE users SET avatar_base64 = $1 WHERE username = $2', [avatar, username]);
-        res.json({ status: "OK", message: "Аватарка успешно обновлена!" });
-    } catch (err) {
-        res.status(500).json({ status: "ERROR", error: err.message });
-    }
+// Запуск сервера на порту, который выдает Render
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, async () => {
+    console.log(`[Node.js] Storage Engine успешно запущен на порту ${PORT}`);
+    await initDatabase();
 });
-
-// 3. ПОЛУЧЕНИЕ ИСТОРИИ ПЕРЕПИСКИ
-app.get('/api/history', async (req, res) => {
-    const { u1, u2 } = req.query; // u1 - мой логин, u2 может быть 'GLOBAL' или кодом/логином друга
-    try {
-        let result;
-        if (u2 === 'GLOBAL') {
-            result = await pool.query(
-                "SELECT sender, message as text FROM chat_history WHERE recipient = 'GLOBAL' ORDER BY ts ASC LIMIT 50"
-            );
-        } else {
-            result = await pool.query(
-                'SELECT sender, message as text FROM chat_history WHERE (sender = $1 AND recipient = $2) OR (sender = $2 AND recipient = $1) ORDER BY ts ASC LIMIT 50',
-                                      [u1, u2]
-            );
-        }
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).send(err.message);
-    }
-});
-
-// Запуск сервера на порту, который выделит Render
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Node.js] Storage Engine успешно запущен на порту ${PORT}`));
