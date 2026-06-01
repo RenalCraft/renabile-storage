@@ -1,276 +1,263 @@
 const WebSocket = require('ws');
-const crypto = require('crypto');
+const { Pool } = require('pg');
 
-// Инициализируем сервер на порту 10000 (дефолтный порт для Render)
 const PORT = process.env.PORT || 10000;
+
+// Подключение к твоей базе PostgreSQL через переменную окружения Render (DATABASE_URL)
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
+
 const wss = new WebSocket.Server({ port: PORT });
+const activeConnections = new Map(); // Сокет -> Username
 
-// Имитация базы данных (хранится в памяти сервера, пока он запущен)
-const db = {
-    users: {},       // Никнейм -> { password, code, avatar }
-    codes: {},       // Код -> Никнейм
-    friendships: {}  // Никнейм -> Set(Никнеймы друзей)
-};
-
-// Хранилище активных подключений: Сокет -> Никнейм
-const activeConnections = new Map();
-
-console.log(`[ЯДРО] Сервер RenaBile запущен на порту ${PORT}`);
+// Инициализация базы данных при старте
+async function initDB() {
+    try {
+        // Таблица пользователей
+        await pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password TEXT NOT NULL,
+            code TEXT UNIQUE NOT NULL,
+            avatar TEXT
+        );
+        `);
+        // Таблица друзей
+        await pool.query(`
+        CREATE TABLE IF NOT EXISTS friends (
+            user1 TEXT,
+            user2 TEXT,
+            PRIMARY KEY (user1, user2)
+        );
+        `);
+        // Полноценная безлимитная таблица истории сообщений
+        await pool.query(`
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            room TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            text TEXT NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        `);
+        console.log('[БАЗА] Все таблицы PostgreSQL успешно верифицированы!');
+    } catch (err) {
+        console.error('[БАЗА ОШИБКА] Ошибка инициализации таблиц:', err.message);
+    }
+}
+initDB();
 
 wss.on('connection', (ws) => {
-    console.log('[СЕТЬ] Новое входящее соединение.');
-
-    ws.on('message', (rawMessage) => {
+    ws.on('message', async (rawMessage) => {
         try {
             const packet = JSON.parse(rawMessage.toString().trim());
             const { type, data } = packet;
 
-            if (!type || !data) return;
-
             switch (type) {
                 case 'REG':
-                    handleRegister(ws, data);
+                    await handleRegister(ws, data);
                     break;
                 case 'AUTH':
-                    handleAuth(ws, data);
+                    await handleAuth(ws, data);
                     break;
                 case 'UPDATE_PROFILE':
-                    handleUpdateProfile(ws, data);
+                    await handleUpdateProfile(ws, data);
                     break;
                 case 'MSG':
-                    handleMessage(ws, data);
+                    await handleMessage(ws, data);
                     break;
                 case 'ADD_FRIEND':
-                    handleAddFriend(ws, data);
+                    await handleAddFriend(ws, data);
                     break;
-                default:
-                    console.log(`[СЕТЬ] Неизвестный тип пакета: ${type}`);
             }
         } catch (err) {
-            console.error('[ОШИБКА] Ошибка парсинга пакета:', err.message);
+            console.error('[СИСТЕМА] Ошибка пакета:', err.message);
         }
     });
 
     ws.on('close', () => {
         const username = activeConnections.get(ws);
         if (username) {
-            console.log(`[СЕТЬ] Пользователь ${username} отключился.`);
             activeConnections.delete(ws);
-            // Оповещаем друзей, что пользователь теперь оффлайн
             broadcastStatusUpdate(username);
-        } else {
-            console.log('[СЕТЬ] Неавторизованный клиент отключился.');
         }
     });
 });
 
-// --- ПОДПРОГРАММЫ ОБРАБОТКИ ПАКЕТОВ ---
-
-// 1. Регистрация нового аккаунта
-function handleRegister(ws, data) {
+async function handleRegister(ws, data) {
     const { username, password, avatar } = data;
+    if (!username || !password) return;
 
-    if (!username || !password) {
-        return sendError(ws, 'REG_OK', 'Имя и пароль не могут быть пустыми');
-    }
+    try {
+        const check = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
+        if (check.rows.length > 0) return;
 
-    if (db.users[username]) {
-        return sendError(ws, 'REG_OK', 'Это имя уже занято');
-    }
+        let code;
+        while (true) {
+            code = Math.floor(1000 + Math.random() * 9000).toString();
+            const codeCheck = await pool.query('SELECT code FROM users WHERE code = $1', [code]);
+            if (codeCheck.rows.length === 0) break;
+        }
 
-    // Генерируем уникальный 4-значный код, которого еще нет в базе
-    let code;
-    do {
-        code = Math.floor(1000 + Math.random() * 9000).toString();
-    } while (db.codes[code]);
-
-    // Сохраняем в "БД"
-    db.users[username] = { password, code, avatar: avatar || "" };
-    db.codes[code] = username;
-    db.friendships[username] = new Set();
-
-    console.log(`[БАЗА] Создан аккаунт: ${username} | Код: #${code}`);
-
-    // Автоматически авторизуем после успешной регистрации
-    authorizeSocket(ws, username, code);
+        await pool.query('INSERT INTO users (username, password, code, avatar) VALUES ($1, $2, $3, $4)', [username, password, code, avatar || ""]);
+        authorizeSocket(ws, username, code);
+    } catch (e) { console.error(e); }
 }
 
-// 2. Авторизация (Вход)
-function handleAuth(ws, data) {
+async function handleAuth(ws, data) {
     const { username, password } = data;
+    try {
+        const res = await pool.query('SELECT password, code FROM users WHERE username = $1', [username]);
+        if (res.rows.length === 0 || res.rows[0].password !== password) return;
 
-    if (!username || !password) {
-        return sendError(ws, 'AUTH_OK', 'Заполните все поля');
-    }
-
-    const user = db.users[username];
-
-    // Простая проверка логина и пароля
-    if (!user || user.password !== password) {
-        console.log(`[БАЗА] Отказ во входе: ${username}`);
-        return ws.send(JSON.stringify({ type: 'auth_fail', data: { message: 'Неверное имя или пароль' } }));
-    }
-
-    console.log(`[БАЗА] Успешный вход: ${username} | Код: #${user.code}`);
-
-    // ПРИВЯЗЫВАЕМ СОКЕТ И НЕ ЗАКРЫВАЕМ ЕГО!
-    authorizeSocket(ws, username, user.code);
+        authorizeSocket(ws, username, res.rows[0].code);
+    } catch (e) { console.error(e); }
 }
 
-// Вспомогательный метод привязки сокета к сессии
-function authorizeSocket(ws, username, code) {
+async function authorizeSocket(ws, username, code) {
     activeConnections.set(ws, username);
+    ws.send(JSON.stringify({ type: 'AUTH_OK', data: { username, code } }));
 
-    // Отправляем клиенту подтверждение успеха
-    ws.send(JSON.stringify({
-        type: 'AUTH_OK',
-        data: { username, code }
-    }));
+    // Отправляем полную безлимитную историю для Глобального чата при входе
+    await sendRoomHistory(ws, 'GLOBAL');
 
-    // Сразу же высылаем обновленный список чатов и друзей
-    sendFriendsList(ws, username);
-
-    // Оповещаем друзей, что мы зашли (стали онлайн)
+    await sendFriendsList(ws, username);
     broadcastStatusUpdate(username);
 }
 
-// 3. Обновление профиля (Смена авы / пароля)
-function handleUpdateProfile(ws, data) {
+async function handleUpdateProfile(ws, data) {
     const username = activeConnections.get(ws);
     if (!username) return;
-
     const { password, avatar } = data;
-    const user = db.users[username];
 
-    if (user) {
-        if (password && password.trim() !== "") user.password = password;
-        if (avatar) user.avatar = avatar;
-
-        console.log(`[БАЗА] Профиль ${username} обновлен.`);
-
-        // Переотправляем список друзей всем, чтобы обновились аватарки
-        sendFriendsList(ws, username);
+    try {
+        if (password && password.trim() !== "") {
+            await pool.query('UPDATE users SET password = $1 WHERE username = $2', [password, username]);
+        }
+        if (avatar) {
+            await pool.query('UPDATE users SET avatar = $1 WHERE username = $2', [avatar, username]);
+        }
+        await sendFriendsList(ws, username);
         broadcastStatusUpdate(username);
-    }
+    } catch (e) { console.error(e); }
 }
 
-// 4. Добавление в друзья по 4-значному коду
-function handleAddFriend(ws, data) {
+async function handleAddFriend(ws, data) {
     const myUsername = activeConnections.get(ws);
     if (!myUsername) return;
-
     const { code } = data;
-    const friendUsername = db.codes[code];
 
-    if (!friendUsername) {
-        console.log(`[ДРУЗЬЯ] Код #${code} не найден`);
-        return;
-    }
+    try {
+        const res = await pool.query('SELECT username FROM users WHERE code = $1', [code]);
+        if (res.rows.length === 0) return;
+        const friendUsername = res.rows[0].username;
 
-    if (friendUsername === myUsername) {
-        return; // Нельзя добавить самого себя
-    }
+        if (myUsername === friendUsername) return;
 
-    // Добавляем обоюдно в списки друзей
-    db.friendships[myUsername].add(friendUsername);
-    db.friendships[friendUsername].add(myUsername);
+        await pool.query('INSERT INTO friends (user1, user2) VALUES ($1, $2) ON CONFLICT DO NOTHING', [myUsername, friendUsername]);
+        await pool.query('INSERT INTO friends (user1, user2) VALUES ($1, $2) ON CONFLICT DO NOTHING', [friendUsername, myUsername]);
 
-    console.log(`[ДРУЗЬЯ] ${myUsername} и ${friendUsername} теперь друзья!`);
+        await sendFriendsList(ws, myUsername);
 
-    // Обновляем списки чатов у обоих пользователей, если они онлайн
-    sendFriendsList(ws, myUsername);
+        // Отправляем также историю ЛС для созданной комнаты (комната называется как код того, с кем общаемся)
+        const myRes = await pool.query('SELECT code FROM users WHERE username = $1', [myUsername]);
+        const myCode = myRes.rows[0].code;
+        await sendRoomHistory(ws, code); // История для меня
 
-    // Ищем сокет друга, чтобы обновить и ему экран в реальном времени
-    for (let [socket, user] of activeConnections.entries()) {
-        if (user === friendUsername) {
-            sendFriendsList(socket, friendUsername);
-            break;
-        }
-    }
-}
-
-// 5. Обработка обмена сообщениями (Глобальный или ЛС)
-function handleMessage(ws, data) {
-    const senderName = activeConnections.get(ws);
-    if (!senderName) return;
-
-    const { to, text, fromCode } = data;
-
-    const messagePacket = {
-        type: 'MSG',
-        data: {
-            senderName,
-            text,
-            from: to === 'GLOBAL' ? 'GLOBAL' : fromCode
-        }
-    };
-
-    if (to === 'GLOBAL') {
-        // Рассылаем всем подключенным пользователям в общий чат
-        const raw = JSON.stringify(messagePacket);
-        for (let client of activeConnections.keys()) {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(raw);
-            }
-        }
-    } else {
-        // Личные сообщения (ЛС). Ищем получателя по его коду
-        const targetUsername = db.codes[to];
-        if (!targetUsername) return;
-
-        const raw = JSON.stringify(messagePacket);
-
-        // Отправляем фрейм получателю, если он в сети
         for (let [socket, user] of activeConnections.entries()) {
-            if (user === targetUsername && socket.readyState === WebSocket.OPEN) {
-                socket.send(raw);
+            if (user === friendUsername) {
+                await sendFriendsList(socket, friendUsername);
+                await sendRoomHistory(socket, myCode); // История для друга
                 break;
             }
         }
-    }
+    } catch (e) { console.error(e); }
 }
 
-// --- СИСТЕМНЫЕ ФУНКЦИИ РАССЫЛКИ ---
+async function handleMessage(ws, data) {
+    const sender = activeConnections.get(ws);
+    if (!sender) return;
+    const { to, text, fromCode } = data;
 
-// Сборка и отправка списка друзей для конкретного юзера
-function sendFriendsList(ws, username) {
-    const friendsSet = db.friendships[username] || new Set();
-    const list = [];
+    let room = to;
+    // Если ЛС, пишем в комнату, названную кодом получателя
+    try {
+        // Сохраняем сообщение в базу данных БЕЗ ЛИМИТОВ
+        await pool.query('INSERT INTO messages (room, sender, text) VALUES ($1, $2, $3)', [room, sender, text]);
 
-    friendsSet.forEach(fName => {
-        const fUser = db.users[fName];
-        if (fUser) {
-            // Проверяем, онлайн ли друг прямо сейчас
-            const isOnline = Array.from(activeConnections.values()).includes(fName);
-            list.push({
-                username: fName,
-                code: fUser.code,
-                avatar: fUser.avatar, // Отдаем Base64 строку аватарки на клиент
-                online: isOnline
-            });
+        const messagePacket = {
+            type: 'MSG',
+            data: { senderName: sender, text, from: to === 'GLOBAL' ? 'GLOBAL' : fromCode }
+        };
+        const raw = JSON.stringify(messagePacket);
+
+        if (to === 'GLOBAL') {
+            for (let client of activeConnections.keys()) {
+                if (client.readyState === WebSocket.OPEN) client.send(raw);
+            }
+        } else {
+            const targetRes = await pool.query('SELECT username FROM users WHERE code = $1', [to]);
+            if (targetRes.rows.length === 0) return;
+            const targetUser = targetRes.rows[0].username;
+
+            // Шлем отправителю и получателю
+            ws.send(raw);
+            for (let [socket, user] of activeConnections.entries()) {
+                if (user === targetUser && socket.readyState === WebSocket.OPEN) {
+                    socket.send(raw);
+                    break;
+                }
+            }
         }
-    });
-
-    ws.send(JSON.stringify({
-        type: 'FRIENDS_LIST',
-        data: { list }
-    }));
+    } catch (e) { console.error(e); }
 }
 
-// Оповещение всех друзей пользователя о смене его статуса (онлайн/оффлайн)
-function broadcastStatusUpdate(username) {
-    const friendsSet = db.friendships[username] || new Set();
+async function sendRoomHistory(ws, room) {
+    try {
+        // Достаем абсолютно ВСЮ историю без оператора LIMIT 50
+        const res = await pool.query(`
+        SELECT sender, text, to_char(timestamp, 'HH24:MI') as time
+        FROM messages
+        WHERE room = $1
+        ORDER BY timestamp ASC
+        `, [room]);
 
-    for (let [socket, user] of activeConnections.entries()) {
-        if (friendsSet.has(user) && socket.readyState === WebSocket.OPEN) {
-            sendFriendsList(socket, user);
+        ws.send(JSON.stringify({
+            type: 'MSG_HISTORY',
+            data: { room, history: res.rows }
+        }));
+    } catch (e) { console.error(e); }
+}
+
+async function sendFriendsList(ws, username) {
+    try {
+        const res = await pool.query(`
+        SELECT u.username, u.code, u.avatar
+        FROM friends f
+        JOIN users u ON f.user2 = u.username
+        WHERE f.user1 = $1
+        `, [username]);
+
+        const list = res.rows.map(row => {
+            const isOnline = Array.from(activeConnections.values()).includes(row.username);
+            return { username: row.username, code: row.code, avatar: row.avatar, online: isOnline };
+        });
+
+        ws.send(JSON.stringify({ type: 'FRIENDS_LIST', data: { list } }));
+    } catch (e) { console.error(e); }
+}
+
+async function broadcastStatusUpdate(username) {
+    try {
+        const res = await pool.query('SELECT user2 FROM friends WHERE user1 = $1', [username]);
+        const friends = res.rows.map(r => r.user2);
+
+        for (let [socket, user] of activeConnections.entries()) {
+            if (friends.includes(user) && socket.readyState === WebSocket.OPEN) {
+                await sendFriendsList(socket, user);
+            }
         }
-    }
-}
-
-function sendError(ws, actionType, message) {
-    ws.send(JSON.stringify({
-        type: 'ERROR',
-        message: message
-    }));
+    } catch (e) { console.error(e); }
 }
