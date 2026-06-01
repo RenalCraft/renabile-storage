@@ -1,12 +1,13 @@
 {
   "name": "renabile-server",
-  "version": "5.5.0",
+  "version": "6.0.0",
   "description": "Core MESH server for RenaBile Messenger",
   "main": "storage-server.js",
   "scripts": {
     "start": "node storage-server.js"
   },
   "dependencies": {
+    "pg": "^8.13.0",
     "ws": "^8.18.0"
   },
   "engines": {
