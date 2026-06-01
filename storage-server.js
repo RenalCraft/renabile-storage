@@ -52,28 +52,37 @@ initDB();
 wss.on('connection', (ws) => {
     ws.on('message', async (rawMessage) => {
         try {
-            const packet = JSON.parse(rawMessage.toString().trim());
-            const { type, data } = packet;
+            const lines = rawMessage.toString().split('\n');
 
-            switch (type) {
-                case 'REG':
-                    await handleRegister(ws, data);
-                    break;
-                case 'AUTH':
-                    await handleAuth(ws, data);
-                    break;
-                case 'UPDATE_PROFILE':
-                    await handleUpdateProfile(ws, data);
-                    break;
-                case 'MSG':
-                    await handleMessage(ws, data);
-                    break;
-                case 'ADD_FRIEND':
-                    await handleAddFriend(ws, data);
-                    break;
+            for (let line of lines) {
+                if (!line.trim()) continue;
+
+                const packet = JSON.parse(line.trim());
+                const { type, data } = packet;
+                const loggedUser = activeConnections.get(ws);
+
+                switch (type) {
+                    case 'REG':
+                        await handleRegister(ws, data);
+                        break;
+                    case 'AUTH':
+                        await handleAuth(ws, data);
+                        break;
+                    case 'UPDATE_PROFILE':
+                        if (loggedUser) {
+                            await handleUpdateProfile(ws, loggedUser, data);
+                        }
+                        break;
+                    case 'MSG':
+                        await handleMessage(ws, data);
+                        break;
+                    case 'ADD_FRIEND':
+                        await handleAddFriend(ws, data);
+                        break;
+                }
             }
         } catch (err) {
-            console.error('[СИСТЕМА] Ошибка пакета:', err.message);
+            console.error('[СИСТЕМА] Ошибка обработки пакета:', err.message);
         }
     });
 
@@ -120,16 +129,12 @@ async function authorizeSocket(ws, username, code) {
     activeConnections.set(ws, username);
     ws.send(JSON.stringify({ type: 'AUTH_OK', data: { username, code } }));
 
-    // Отправляем полную безлимитную историю для Глобального чата при входе
     await sendRoomHistory(ws, 'GLOBAL');
-
     await sendFriendsList(ws, username);
     broadcastStatusUpdate(username);
 }
 
-async function handleUpdateProfile(ws, data) {
-    const username = activeConnections.get(ws);
-    if (!username) return;
+async function handleUpdateProfile(ws, username, data) {
     const { password, avatar } = data;
 
     try {
@@ -137,11 +142,16 @@ async function handleUpdateProfile(ws, data) {
             await pool.query('UPDATE users SET password = $1 WHERE username = $2', [password, username]);
         }
         if (avatar) {
+            console.log(`[БАЗА] Обновление аватарки для ${username} (Длина Base64: ${avatar.length})`);
             await pool.query('UPDATE users SET avatar = $1 WHERE username = $2', [avatar, username]);
         }
+
+        // Обновляем список у самого юзера и пушим всем его друзьям в сети
         await sendFriendsList(ws, username);
-        broadcastStatusUpdate(username);
-    } catch (e) { console.error(e); }
+        await broadcastStatusUpdate(username);
+
+        console.log(`[СИСТЕМА] Профиль ${username} успешно синхронизирован со всей MESH-сетью.`);
+    } catch (e) { console.error('[БАЗА ОШИБКА]', e.message); }
 }
 
 async function handleAddFriend(ws, data) {
@@ -161,15 +171,14 @@ async function handleAddFriend(ws, data) {
 
         await sendFriendsList(ws, myUsername);
 
-        // Отправляем также историю ЛС для созданной комнаты (комната называется как код того, с кем общаемся)
         const myRes = await pool.query('SELECT code FROM users WHERE username = $1', [myUsername]);
         const myCode = myRes.rows[0].code;
-        await sendRoomHistory(ws, code); // История для меня
+        await sendRoomHistory(ws, code);
 
         for (let [socket, user] of activeConnections.entries()) {
             if (user === friendUsername) {
                 await sendFriendsList(socket, friendUsername);
-                await sendRoomHistory(socket, myCode); // История для друга
+                await sendRoomHistory(socket, myCode);
                 break;
             }
         }
@@ -182,9 +191,7 @@ async function handleMessage(ws, data) {
     const { to, text, fromCode } = data;
 
     let room = to;
-    // Если ЛС, пишем в комнату, названную кодом получателя
     try {
-        // Сохраняем сообщение в базу данных БЕЗ ЛИМИТОВ
         await pool.query('INSERT INTO messages (room, sender, text) VALUES ($1, $2, $3)', [room, sender, text]);
 
         const messagePacket = {
@@ -202,7 +209,6 @@ async function handleMessage(ws, data) {
             if (targetRes.rows.length === 0) return;
             const targetUser = targetRes.rows[0].username;
 
-            // Шлем отправителю и получателю
             ws.send(raw);
             for (let [socket, user] of activeConnections.entries()) {
                 if (user === targetUser && socket.readyState === WebSocket.OPEN) {
@@ -216,7 +222,6 @@ async function handleMessage(ws, data) {
 
 async function sendRoomHistory(ws, room) {
     try {
-        // Достаем абсолютно ВСЮ историю без оператора LIMIT 50
         const res = await pool.query(`
         SELECT sender, text, to_char(timestamp, 'HH24:MI') as time
         FROM messages
