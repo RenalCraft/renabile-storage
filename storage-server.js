@@ -15,21 +15,21 @@ const activeConnections = new Map(); // Сокет -> Username
 // Инициализация базы данных при старте
 async function initDB() {
     try {
-        // Таблица пользователей
+        // Таблица пользователей (синхронизировано с Java-моделью)
         await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             password TEXT NOT NULL,
-            code TEXT UNIQUE NOT NULL,
-            avatar TEXT
+            user_code TEXT UNIQUE NOT NULL,
+            avatar_base64 TEXT
         );
         `);
-        // Таблица друзей
+        // Таблица друзей (синхронизировано с Java-моделью)
         await pool.query(`
         CREATE TABLE IF NOT EXISTS friends (
-            user1 TEXT,
-            user2 TEXT,
-            PRIMARY KEY (user1, user2)
+            username TEXT,
+            friend_name TEXT,
+            PRIMARY KEY (username, friend_name)
         );
         `);
         // Полноценная безлимитная таблица истории сообщений
@@ -42,7 +42,7 @@ async function initDB() {
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         `);
-        console.log('[БАЗА] Все таблицы PostgreSQL успешно верифицированы!');
+        console.log('[БАЗА] Все таблицы PostgreSQL успешно верифицированы под Java-стандарт!');
     } catch (err) {
         console.error('[БАЗА ОШИБКА] Ошибка инициализации таблиц:', err.message);
     }
@@ -106,11 +106,11 @@ async function handleRegister(ws, data) {
         let code;
         while (true) {
             code = Math.floor(1000 + Math.random() * 9000).toString();
-            const codeCheck = await pool.query('SELECT code FROM users WHERE code = $1', [code]);
+            const codeCheck = await pool.query('SELECT user_code FROM users WHERE user_code = $1', [code]);
             if (codeCheck.rows.length === 0) break;
         }
 
-        await pool.query('INSERT INTO users (username, password, code, avatar) VALUES ($1, $2, $3, $4)', [username, password, code, avatar || ""]);
+        await pool.query('INSERT INTO users (username, password, user_code, avatar_base64) VALUES ($1, $2, $3, $4)', [username, password, code, avatar || ""]);
         authorizeSocket(ws, username, code);
     } catch (e) { console.error(e); }
 }
@@ -118,10 +118,10 @@ async function handleRegister(ws, data) {
 async function handleAuth(ws, data) {
     const { username, password } = data;
     try {
-        const res = await pool.query('SELECT password, code FROM users WHERE username = $1', [username]);
+        const res = await pool.query('SELECT password, user_code FROM users WHERE username = $1', [username]);
         if (res.rows.length === 0 || res.rows[0].password !== password) return;
 
-        authorizeSocket(ws, username, res.rows[0].code);
+        authorizeSocket(ws, username, res.rows[0].user_code);
     } catch (e) { console.error(e); }
 }
 
@@ -143,10 +143,9 @@ async function handleUpdateProfile(ws, username, data) {
         }
         if (avatar) {
             console.log(`[БАЗА] Обновление аватарки для ${username} (Длина Base64: ${avatar.length})`);
-            await pool.query('UPDATE users SET avatar = $1 WHERE username = $2', [avatar, username]);
+            await pool.query('UPDATE users SET avatar_base64 = $1 WHERE username = $2', [avatar, username]);
         }
 
-        // Обновляем список у самого юзера и пушим всем его друзьям в сети
         await sendFriendsList(ws, username);
         await broadcastStatusUpdate(username);
 
@@ -160,19 +159,19 @@ async function handleAddFriend(ws, data) {
     const { code } = data;
 
     try {
-        const res = await pool.query('SELECT username FROM users WHERE code = $1', [code]);
+        const res = await pool.query('SELECT username FROM users WHERE user_code = $1', [code]);
         if (res.rows.length === 0) return;
         const friendUsername = res.rows[0].username;
 
         if (myUsername === friendUsername) return;
 
-        await pool.query('INSERT INTO friends (user1, user2) VALUES ($1, $2) ON CONFLICT DO NOTHING', [myUsername, friendUsername]);
-        await pool.query('INSERT INTO friends (user1, user2) VALUES ($1, $2) ON CONFLICT DO NOTHING', [friendUsername, myUsername]);
+        await pool.query('INSERT INTO friends (username, friend_name) VALUES ($1, $2) ON CONFLICT DO NOTHING', [myUsername, friendUsername]);
+        await pool.query('INSERT INTO friends (username, friend_name) VALUES ($1, $2) ON CONFLICT DO NOTHING', [friendUsername, myUsername]);
 
         await sendFriendsList(ws, myUsername);
 
-        const myRes = await pool.query('SELECT code FROM users WHERE username = $1', [myUsername]);
-        const myCode = myRes.rows[0].code;
+        const myRes = await pool.query('SELECT user_code FROM users WHERE username = $1', [myUsername]);
+        const myCode = myRes.rows[0].user_code;
         await sendRoomHistory(ws, code);
 
         for (let [socket, user] of activeConnections.entries()) {
@@ -205,7 +204,7 @@ async function handleMessage(ws, data) {
                 if (client.readyState === WebSocket.OPEN) client.send(raw);
             }
         } else {
-            const targetRes = await pool.query('SELECT username FROM users WHERE code = $1', [to]);
+            const targetRes = await pool.query('SELECT username FROM users WHERE user_code = $1', [to]);
             if (targetRes.rows.length === 0) return;
             const targetUser = targetRes.rows[0].username;
 
@@ -239,15 +238,15 @@ async function sendRoomHistory(ws, room) {
 async function sendFriendsList(ws, username) {
     try {
         const res = await pool.query(`
-        SELECT u.username, u.code, u.avatar
+        SELECT u.username, u.user_code, u.avatar_base64
         FROM friends f
-        JOIN users u ON f.user2 = u.username
-        WHERE f.user1 = $1
+        JOIN users u ON f.friend_name = u.username
+        WHERE f.username = $1
         `, [username]);
 
         const list = res.rows.map(row => {
             const isOnline = Array.from(activeConnections.values()).includes(row.username);
-            return { username: row.username, code: row.code, avatar: row.avatar, online: isOnline };
+            return { username: row.username, code: row.user_code, avatar: row.avatar_base64 || "", online: isOnline };
         });
 
         ws.send(JSON.stringify({ type: 'FRIENDS_LIST', data: { list } }));
@@ -256,8 +255,8 @@ async function sendFriendsList(ws, username) {
 
 async function broadcastStatusUpdate(username) {
     try {
-        const res = await pool.query('SELECT user2 FROM friends WHERE user1 = $1', [username]);
-        const friends = res.rows.map(r => r.user2);
+        const res = await pool.query('SELECT friend_name FROM friends WHERE username = $1', [username]);
+        const friends = res.rows.map(r => r.friend_name);
 
         for (let [socket, user] of activeConnections.entries()) {
             if (friends.includes(user) && socket.readyState === WebSocket.OPEN) {
@@ -266,3 +265,5 @@ async function broadcastStatusUpdate(username) {
         }
     } catch (e) { console.error(e); }
 }
+
+console.log(`[СИСТЕМА] Инициализация Node.js WebSocket-сервера на порту ${PORT}...`);
