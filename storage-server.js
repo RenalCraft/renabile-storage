@@ -373,7 +373,7 @@ initDatabase().then(() => {
                 return;
             }
 
-            const { to, text } = data;
+            const { to, text, clientMsgId } = data;
             if (!to || !text || !text.trim()) {
                 return;
             }
@@ -395,7 +395,8 @@ initDatabase().then(() => {
                             sendPacket(client, 'MSG', {
                                 from: 'GLOBAL',
                                 senderName: senderUsername,
-                                text: text
+                                text: text,
+                                clientMsgId: clientMsgId || ""
                             });
                         }
                     });
@@ -406,7 +407,8 @@ initDatabase().then(() => {
                         sendPacket(targetCompanionWs, 'MSG', {
                             from: authenticatedUserCode,
                             senderName: senderUsername,
-                            text: text
+                            text: text,
+                            clientMsgId: clientMsgId || ""
                         });
                     }
 
@@ -414,7 +416,8 @@ initDatabase().then(() => {
                     sendPacket(ws, 'MSG', {
                         from: to,
                         senderName: senderUsername,
-                        text: text
+                        text: text,
+                        clientMsgId: clientMsgId || ""
                     });
                 }
             } catch (err) {
