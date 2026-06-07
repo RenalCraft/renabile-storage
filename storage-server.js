@@ -117,6 +117,20 @@ async function initDatabase() {
         }
         try {
             await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS timestamp BIGINT;');
+            // Verify and migrate database schemas containing obsolete timestamp data types (e.g., TIMESTAMP)
+            const checkTypeRes = await pool.query(`
+            SELECT data_type FROM information_schema.columns
+            WHERE table_name = 'messages' AND column_name = 'timestamp';
+            `);
+            if (checkTypeRes.rows.length > 0) {
+                const dataType = checkTypeRes.rows[0].data_type;
+                if (dataType && !dataType.toLowerCase().includes('bigint') && !dataType.toLowerCase().includes('numeric')) {
+                    console.log('[DB Migration] Messages timestamp column is of invalid type:', dataType, '. Dropping and recreating as BIGINT...');
+                    await pool.query('ALTER TABLE messages DROP COLUMN timestamp CASCADE;');
+                    await pool.query('ALTER TABLE messages ADD COLUMN timestamp BIGINT DEFAULT 0;');
+                    console.log('[DB Migration] Messages timestamp column successfully migrated to BIGINT.');
+                }
+            }
         } catch (err) {
             console.log('[DB Migration Messages timestamp warning]:', err.message);
         }
@@ -408,12 +422,7 @@ initDatabase().then(() => {
                 const now = new Date();
                 const timeStr = now.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 
-                // Record into db
-                await pool.query(
-                    'INSERT INTO messages (room, sender, sender_code, text, time, timestamp) VALUES ($1, $2, $3, $4, $5, $6)',
-                                 [to, senderUsername, authenticatedUserCode, text, timeStr, now.getTime()]
-                );
-
+                // 1. BROADCAST IMMEDIATELY (sub-millisecond WebSocket delivery)
                 if (to === 'GLOBAL') {
                     wss.clients.forEach(client => {
                         if (client.readyState === WebSocket.OPEN) {
@@ -445,8 +454,17 @@ initDatabase().then(() => {
                         clientMsgId: clientMsgId || ""
                     });
                 }
+
+                // 2. PERSIST TO POSTGRES ASYNC (Decoupled from realtime WebSocket delivery)
+                pool.query(
+                    'INSERT INTO messages (room, sender, sender_code, text, time, timestamp) VALUES ($1, $2, $3, $4, $5, $6)',
+                           [to, senderUsername, authenticatedUserCode, text, timeStr, now.getTime()]
+                ).catch(err => {
+                    console.error('[MSG] Async DB write failure:', err.message);
+                });
+
             } catch (err) {
-                console.error('[MSG] DB write failure on sending message:', err.message);
+                console.error('[MSG] Send error:', err.message);
             }
         }
     });
