@@ -91,11 +91,36 @@ async function initDatabase() {
 
         // Live migrations for Messages table
         try {
-            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_code VARCHAR(4);');
-            console.log('[DB] Messages table live migrations validated.');
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS room VARCHAR(255);');
         } catch (err) {
-            console.log('[DB Migration Warning] Messages table migrations ignored or already applied:', err.message);
+            console.log('[DB Migration Messages room warning]:', err.message);
         }
+        try {
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender VARCHAR(255);');
+        } catch (err) {
+            console.log('[DB Migration Messages sender warning]:', err.message);
+        }
+        try {
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_code VARCHAR(4);');
+        } catch (err) {
+            console.log('[DB Migration Messages sender_code warning]:', err.message);
+        }
+        try {
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS text TEXT;');
+        } catch (err) {
+            console.log('[DB Migration Messages text warning]:', err.message);
+        }
+        try {
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS time VARCHAR(30);');
+        } catch (err) {
+            console.log('[DB Migration Messages time warning]:', err.message);
+        }
+        try {
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS timestamp BIGINT;');
+        } catch (err) {
+            console.log('[DB Migration Messages timestamp warning]:', err.message);
+        }
+        console.log('[DB] Messages table live migrations validated.');
 
         // Mark everyone offline initially on server restart
         await pool.query('UPDATE users SET online = false;');
