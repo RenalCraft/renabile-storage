@@ -134,6 +134,20 @@ async function initDatabase() {
         } catch (err) {
             console.log('[DB Migration Messages timestamp warning]:', err.message);
         }
+
+        try {
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_msg_id VARCHAR(255);');
+        } catch (err) {}
+        try {
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS reaction VARCHAR(255) DEFAULT \'\';');
+        } catch (err) {}
+        try {
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_edited BOOLEAN DEFAULT FALSE;');
+        } catch (err) {}
+        try {
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE;');
+        } catch (err) {}
+
         console.log('[DB] Messages table live migrations validated.');
 
         // Mark everyone offline initially on server restart
@@ -220,6 +234,12 @@ initDatabase().then(() => {
                     break;
                 case 'MSG':
                     await handleSendMessage(ws, data);
+                    break;
+                case 'UPDATE_PROFILE':
+                    await handleUpdateProfile(ws, data);
+                    break;
+                case 'MSG_UPDATE':
+                    await handleMsgUpdate(ws, data);
                     break;
                 default:
                     sendPacket(ws, 'ERROR', { message: `Неизвестный тип пакета: ${type}` });
@@ -457,14 +477,100 @@ initDatabase().then(() => {
 
                 // 2. PERSIST TO POSTGRES ASYNC (Decoupled from realtime WebSocket delivery)
                 pool.query(
-                    'INSERT INTO messages (room, sender, sender_code, text, time, timestamp) VALUES ($1, $2, $3, $4, $5, $6)',
-                           [to, senderUsername, authenticatedUserCode, text, timeStr, now.getTime()]
+                    'INSERT INTO messages (room, sender, sender_code, text, time, timestamp, client_msg_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+                           [to, senderUsername, authenticatedUserCode, text, timeStr, now.getTime(), clientMsgId || ""]
                 ).catch(err => {
                     console.error('[MSG] Async DB write failure:', err.message);
                 });
 
             } catch (err) {
                 console.error('[MSG] Send error:', err.message);
+            }
+        }
+
+        async function handleUpdateProfile(ws, data) {
+            if (!authenticatedUserCode) {
+                sendPacket(ws, 'ERROR', { message: "Сессия не авторизована." });
+                return;
+            }
+
+            const { username, password, avatar } = data;
+            if (!username || !username.trim()) {
+                sendPacket(ws, 'ERROR', { message: "Имя не может быть пустым." });
+                return;
+            }
+
+            try {
+                if (password && password.trim()) {
+                    await pool.query(
+                        'UPDATE users SET username = $1, password = $2, avatar = $3 WHERE code = $4',
+                        [username.trim(), password.trim().toLowerCase(), avatar || "", authenticatedUserCode]
+                    );
+                } else {
+                    await pool.query(
+                        'UPDATE users SET username = $1, avatar = $2 WHERE code = $3',
+                        [username.trim(), avatar || "", authenticatedUserCode]
+                    );
+                }
+
+                console.log(`[Profile Update] Code #${authenticatedUserCode} updated to ${username}`);
+
+                // Send success confirmation packet
+                sendPacket(ws, 'AUTH_OK', { username: username.trim(), code: authenticatedUserCode });
+
+                // Refresh lists
+                await sendFriendsList(ws, authenticatedUserCode);
+                await broadcastToFriends(authenticatedUserCode);
+            } catch (err) {
+                console.error('[UPDATE_PROFILE] Failed:', err.message);
+                sendPacket(ws, 'ERROR', { message: "Ошибка бэкенда при обновлении профиля." });
+            }
+        }
+
+        async function handleMsgUpdate(ws, data) {
+            if (!authenticatedUserCode) {
+                sendPacket(ws, 'ERROR', { message: "Сессия не авторизована." });
+                return;
+            }
+
+            const { clientMsgId, room, text, reaction, isEdited, isDeleted } = data;
+            if (!clientMsgId) return;
+
+            try {
+                // Async database update
+                pool.query(
+                    'UPDATE messages SET text = $1, reaction = $2, is_edited = $3, is_deleted = $4 WHERE client_msg_id = $5',
+                    [text || "", reaction || "", !!isEdited, !!isDeleted, clientMsgId]
+                ).catch(err => {
+                    console.error('[MSG_UPDATE] DB write error:', err.message);
+                });
+
+                // Prepare update frame
+                const updateFrame = {
+                    clientMsgId,
+                    room,
+                    text: text || "",
+                    reaction: reaction || "",
+                    isEdited: !!isEdited,
+                    isDeleted: !!isDeleted
+                };
+
+                // Broadcast
+                if (room === 'GLOBAL') {
+                    wss.clients.forEach(client => {
+                        if (client.readyState === WebSocket.OPEN) {
+                            sendPacket(client, 'MSG_UPDATE', updateFrame);
+                        }
+                    });
+                } else {
+                    const companionWs = activeConnections.get(room);
+                    if (companionWs && companionWs.readyState === WebSocket.OPEN) {
+                        sendPacket(companionWs, 'MSG_UPDATE', updateFrame);
+                    }
+                    sendPacket(ws, 'MSG_UPDATE', updateFrame);
+                }
+            } catch (err) {
+                console.error('[MSG_UPDATE] broadcast error:', err.message);
             }
         }
     });
