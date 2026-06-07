@@ -38,6 +38,11 @@ async function initDatabase() {
 
         // Live migrations for Users table (safe if columns already exist)
         try {
+            await pool.query('ALTER TABLE users DROP COLUMN IF EXISTS user_code CASCADE;');
+        } catch (err) {
+            console.log('[DB Migration user_code warning] Ignored or already dropped:', err.message);
+        }
+        try {
             await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS password VARCHAR(255);');
         } catch (err) {
             console.log('[DB Migration password warning] Ignored or already applied:', err.message);
