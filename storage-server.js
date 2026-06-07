@@ -277,7 +277,7 @@ initDatabase().then(() => {
 
                 console.log(`[REG] Registered: ${username} with code #${code}`);
 
-                sendPacket(ws, 'AUTH_OK', { username, code });
+                sendPacket(ws, 'AUTH_OK', { username, code, avatar: avatar || "" });
                 await sendFriendsList(ws, code);
             } catch (err) {
                 console.error('[REG] DB failure during registration:', err.message);
@@ -296,7 +296,7 @@ initDatabase().then(() => {
             const usernameLower = username.toLowerCase();
 
             try {
-                const userRes = await pool.query('SELECT username, password, code FROM users WHERE LOWER(username) = $1 LIMIT 1', [usernameLower]);
+                const userRes = await pool.query('SELECT username, password, code, avatar FROM users WHERE LOWER(username) = $1 LIMIT 1', [usernameLower]);
                 if (userRes.rowCount === 0) {
                     sendPacket(ws, 'ERROR', { message: "Ошибка авторизации: Пользователь не существует" });
                     return;
@@ -318,7 +318,7 @@ initDatabase().then(() => {
 
                 console.log(`[AUTH] Authenticated: ${user.username} (#${user.code})`);
 
-                sendPacket(ws, 'AUTH_OK', { username: user.username, code: user.code });
+                sendPacket(ws, 'AUTH_OK', { username: user.username, code: user.code, avatar: user.avatar || "" });
                 await sendFriendsList(ws, user.code);
                 await broadcastToFriends(user.code);
             } catch (err) {
@@ -516,7 +516,7 @@ initDatabase().then(() => {
                 console.log(`[Profile Update] Code #${authenticatedUserCode} updated to ${username}`);
 
                 // Send success confirmation packet
-                sendPacket(ws, 'AUTH_OK', { username: username.trim(), code: authenticatedUserCode });
+                sendPacket(ws, 'AUTH_OK', { username: username.trim(), code: authenticatedUserCode, avatar: avatar || "" });
 
                 // Refresh lists
                 await sendFriendsList(ws, authenticatedUserCode);
