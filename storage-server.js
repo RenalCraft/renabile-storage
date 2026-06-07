@@ -36,6 +36,20 @@ async function initDatabase() {
         `);
         console.log('[DB] Users table verified.');
 
+        // Live migrations for Users table (safe if columns already exist)
+        try {
+            await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS password VARCHAR(255);');
+            await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS code VARCHAR(4);');
+            await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;');
+            await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS online BOOLEAN DEFAULT FALSE;');
+            try {
+                await pool.query('ALTER TABLE users ADD CONSTRAINT unique_code_node UNIQUE (code);');
+            } catch (err) {}
+            console.log('[DB] Users table live migrations validated.');
+        } catch (err) {
+            console.log('[DB Migration Warning] Users table migrations ignored or already applied:', err.message);
+        }
+
         await pool.query(`
         CREATE TABLE IF NOT EXISTS friendships (
             user_code VARCHAR(4) NOT NULL,
@@ -57,6 +71,14 @@ async function initDatabase() {
         );
         `);
         console.log('[DB] Messages table verified.');
+
+        // Live migrations for Messages table
+        try {
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_code VARCHAR(4);');
+            console.log('[DB] Messages table live migrations validated.');
+        } catch (err) {
+            console.log('[DB Migration Warning] Messages table migrations ignored or already applied:', err.message);
+        }
 
         // Mark everyone offline initially on server restart
         await pool.query('UPDATE users SET online = false;');
