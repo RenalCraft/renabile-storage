@@ -12,11 +12,38 @@ const pool = new Pool({
 const wss = new WebSocket.Server({ port: PORT });
 const activeConnections = new Map(); // Сокет -> Username
 
-function hashPassword(password) {
+// Генерация SHA-256 в нижнем регистре
+function computeHash(text) {
+    return crypto.createHash('sha256').update(text).digest('hex').toLowerCase();
+}
+
+// Умная многоуровневая проверка пароля на бэкенде
+function passwordMatches(incomingPassword, storedPassword) {
+    if (!incomingPassword || !storedPassword) return false;
+
+    const incomingLower = incomingPassword.toLowerCase();
+    const storedLower = storedPassword.toLowerCase();
+
+    // 1. Прямое совпадение клиентского хэша
+    if (incomingLower === storedLower) return true;
+
+    // 2. Совпадение если входящий пароль был в открытом виде
+    const hashedOnce = computeHash(incomingPassword);
+    if (hashedOnce === storedLower) return true;
+
+    // 3. Совпадение для унаследованных записей с двойным хэшированием
+    const doubleHashed = computeHash(hashedOnce);
+    if (doubleHashed === storedLower) return true;
+
+    return false;
+}
+
+function hashPasswordForStorage(password) {
+    // Если это уже хэш (64 hex-символа), сохраняем как есть
     if (password.length === 64 && /^[0-9a-fA-F]+$/.test(password)) {
-        return password; // Уже SHA-256 хэш
+        return password.toLowerCase();
     }
-    return crypto.createHash('sha256').update(password).digest('hex');
+    return computeHash(password);
 }
 
 async function initDB() {
@@ -42,7 +69,7 @@ async function initDB() {
             text TEXT NOT NULL,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );`);
-        console.log('[БАЗА] Все таблицы PostgreSQL успешно верифицированы под Java-стандарт!');
+        console.log('[БАЗА] Все таблицы PostgreSQL успешно верифицированы!');
     } catch (err) {
         console.error('[БАЗА ОШИБКА] Ошибка инициализации таблиц:', err.message);
     }
@@ -50,6 +77,9 @@ async function initDB() {
 initDB();
 
 wss.on('connection', (ws) => {
+    // Расширенный вывод сырого лога сетевых соединений
+    console.log(`[СЕТЬ] Новое входящее подключение WebSocket со стороны: ${ws._socket?.remoteAddress || 'Неизвестно'}`);
+
     ws.on('message', async (rawMessage) => {
         try {
             const lines = rawMessage.toString().split('\n');
@@ -61,9 +91,8 @@ wss.on('connection', (ws) => {
                 const { type, data } = packet;
                 const loggedUser = activeConnections.get(ws);
 
-                // Безопасное логирование: скрываем конфиденциальные данные
                 if (type === 'REG' || type === 'AUTH') {
-                    console.log(`[ПАКЕТ] Запрос авторизации/регистрации. [ДАННЫЕ КРИПТОЗАЩИЩЕНЫ]`);
+                    console.log(`[ПАКЕТ] Запрос авторизации/регистрации. [КРИПТОЗАЩИЩЕНО]`);
                 } else {
                     console.log(`[ПАКЕТ] Тип: ${type}`);
                 }
@@ -84,7 +113,7 @@ wss.on('connection', (ws) => {
                     case 'ADD_FRIEND':
                         await handleAddFriend(ws, data);
                         break;
-                    case 'GET_HISTORY': // Явный запрос истории от клиента
+                    case 'GET_HISTORY':
                         if (data && data.room) await sendRoomHistory(ws, data.room);
                         break;
                 }
@@ -97,9 +126,14 @@ wss.on('connection', (ws) => {
     ws.on('close', () => {
         const username = activeConnections.get(ws);
         if (username) {
+            console.log(`[СЕТЬ] Пользователь ${username} отключился`);
             activeConnections.delete(ws);
             broadcastStatusUpdate(username);
         }
+    });
+
+    ws.on('error', (err) => {
+        console.error('[СЕТЬ ОШИБКА] Ошибка на сокете:', err.message);
     });
 });
 
@@ -114,7 +148,7 @@ async function handleRegister(ws, data) {
             return;
         }
 
-        const securePassword = hashPassword(password);
+        const securePassword = hashPasswordForStorage(password);
         let code;
         while (true) {
             code = Math.floor(1000 + Math.random() * 9000).toString();
@@ -124,22 +158,34 @@ async function handleRegister(ws, data) {
 
         await pool.query('INSERT INTO users (username, password, user_code, avatar_base64) VALUES ($1, $2, $3, $4)', [username, securePassword, code, avatar || ""]);
         authorizeSocket(ws, username, code);
-    } catch (e) { console.error(e); }
+    } catch (e) {
+        console.error('[РЕГИСТРАЦИЯ] Ошибка:', e.message);
+        ws.send(JSON.stringify({ type: 'ERROR', data: { message: 'Ошибка базы данных при регистрации' } }));
+    }
 }
 
 async function handleAuth(ws, data) {
     const { username, password } = data;
     try {
         const res = await pool.query('SELECT password, user_code FROM users WHERE username = $1', [username]);
-        const securePassword = hashPassword(password);
 
-        if (res.rows.length === 0 || res.rows[0].password !== securePassword) {
+        if (res.rows.length === 0) {
+            ws.send(JSON.stringify({ type: 'ERROR', data: { message: 'Пользователь не найден' } }));
+            return;
+        }
+
+        const storedPassword = res.rows[0].password;
+
+        if (!passwordMatches(password, storedPassword)) {
             ws.send(JSON.stringify({ type: 'ERROR', data: { message: 'Неверные данные входа' } }));
             return;
         }
 
         authorizeSocket(ws, username, res.rows[0].user_code);
-    } catch (e) { console.error(e); }
+    } catch (e) {
+        console.error('[АВТОРИЗАЦИЯ] Ошибка:', e.message);
+        ws.send(JSON.stringify({ type: 'ERROR', data: { message: 'Ошибка базы данных при авторизации' } }));
+    }
 }
 
 async function authorizeSocket(ws, username, code) {
@@ -155,14 +201,14 @@ async function handleUpdateProfile(ws, username, data) {
     const { password, avatar } = data;
     try {
         if (password && password.trim() !== "") {
-            await pool.query('UPDATE users SET password = $1 WHERE username = $2', [hashPassword(password), username]);
+            await pool.query('UPDATE users SET password = $1 WHERE username = $2', [hashPasswordForStorage(password), username]);
         }
         if (avatar) {
             await pool.query('UPDATE users SET avatar_base64 = $1 WHERE username = $2', [avatar, username]);
         }
         await sendFriendsList(ws, username);
         await broadcastStatusUpdate(username);
-    } catch (e) { console.error('[БАЗА ОШИБКА]', e.message); }
+    } catch (e) { console.error('[ПРОФИЛЬ] Ошибка обновления:', e.message); }
 }
 
 async function handleAddFriend(ws, data) {
@@ -172,10 +218,16 @@ async function handleAddFriend(ws, data) {
 
     try {
         const res = await pool.query('SELECT username FROM users WHERE user_code = $1', [code]);
-        if (res.rows.length === 0) return;
+        if (res.rows.length === 0) {
+            ws.send(JSON.stringify({ type: 'ERROR', data: { message: 'Пользователь не найден' } }));
+            return;
+        }
         const friendUsername = res.rows[0].username;
 
-        if (myUsername === friendUsername) return;
+        if (myUsername === friendUsername) {
+            ws.send(JSON.stringify({ type: 'ERROR', data: { message: 'Нельзя добавить самого себя' } }));
+            return;
+        }
 
         await pool.query('INSERT INTO friends (username, friend_name) VALUES ($1, $2) ON CONFLICT DO NOTHING', [myUsername, friendUsername]);
         await pool.query('INSERT INTO friends (username, friend_name) VALUES ($1, $2) ON CONFLICT DO NOTHING', [friendUsername, myUsername]);
@@ -214,7 +266,6 @@ async function handleMessage(ws, data) {
                 if (client.readyState === WebSocket.OPEN) client.send(raw);
             }
         } else {
-            // Для приватных сообщений: шлём отправителю и получателю напрямую
             ws.send(raw);
             const targetRes = await pool.query('SELECT username FROM users WHERE user_code = $1', [to]);
             if (targetRes.rows.length === 0) return;
@@ -222,7 +273,6 @@ async function handleMessage(ws, data) {
 
             for (let [socket, user] of activeConnections.entries()) {
                 if (user === targetUser && socket.readyState === WebSocket.OPEN) {
-                    // Чтобы у получателя открылся нужный диалог, поле 'from' должно быть кодом отправителя
                     const receiverPacket = {
                         type: 'MSG',
                         data: { senderName: sender, text, from: fromCode }
