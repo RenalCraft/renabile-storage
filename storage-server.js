@@ -88,349 +88,326 @@ async function initDatabase() {
     }
 }
 
-// Initialize database
-initDatabase();
-
-// Generate a random unique 4-digit code (e.g. "4921")
-async function generateUniqueCode() {
-    let attempt = 0;
-    while (attempt < 10000) {
-        const num = Math.floor(Math.random() * 10000);
-        const codeStr = String(num).padStart(4, '0');
-
-        // Check uniqueness in DB
-        const res = await pool.query('SELECT 1 FROM users WHERE code = $1 LIMIT 1', [codeStr]);
-        if (res.rowCount === 0) {
-            return codeStr;
-        }
-        attempt++;
-    }
-    throw new Error("Unable to generate unique 4-digit code. Range exceeded.");
-}
-
-// Get username safely by code
-async function getUsernameByCode(code) {
-    try {
-        const res = await pool.query('SELECT username FROM users WHERE code = $1 LIMIT 1', [code]);
-        return res.rows[0] ? res.rows[0].username : "Пользователь";
-    } catch (err) {
-        return "Пользователь";
-    }
-}
-
 // Map userCodes to active WebSocket connections
 const activeConnections = new Map(); // userCode -> WebSocket
 
-// Create WebSocket Server
-const wss = new WebSocketServer({ port: PORT });
-console.log(`[RenaBile Server] WebSocket Listening on port ${PORT}`);
+let wss = null;
 
-wss.on('connection', (ws) => {
-    let authenticatedUserCode = null;
-    console.log('[Connection] User connected over WebSockets.');
+// Initialize database then launch the secure server engine
+initDatabase().then(() => {
+    wss = new WebSocketServer({ port: PORT });
+    console.log(`[RenaBile Server] WebSocket Listening on port ${PORT}`);
 
-    ws.on('message', async (message) => {
-        const payloadStr = message.toString();
-        // Server packets are split on '\n'
-        const lines = payloadStr.split('\n');
+    wss.on('connection', (ws) => {
+        let authenticatedUserCode = null;
+        console.log('[Connection] User connected over WebSockets.');
 
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
+        ws.on('message', async (message) => {
+            const payloadStr = message.toString();
+            // Server packets are split on '\n'
+            const lines = payloadStr.split('\n');
+
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+
+                try {
+                    const packet = JSON.parse(trimmed);
+                    await handlePacket(ws, packet);
+                } catch (err) {
+                    console.error('[Connection] Error processing packet:', err.message, 'Raw line:', trimmed);
+                    sendPacket(ws, 'ERROR', { message: "Неправильный формат запроса" });
+                }
+            }
+        });
+
+        ws.on('close', async () => {
+            console.log('[Connection] User disconnected.');
+            if (authenticatedUserCode) {
+                try {
+                    await pool.query('UPDATE users SET online = false WHERE code = $1', [authenticatedUserCode]);
+                    console.log(`[Status] Offline: #${authenticatedUserCode}`);
+                    activeConnections.delete(authenticatedUserCode);
+                    await broadcastToFriends(authenticatedUserCode);
+                } catch (err) {
+                    console.error('[Connection] Error taking user offline in DB:', err.message);
+                }
+            }
+        });
+
+        ws.on('error', (err) => {
+            console.error('[Connection] Socket error occurred:', err.message);
+        });
+
+        // Handle incoming client packet types
+        async function handlePacket(ws, packet) {
+            const { type, data } = packet;
+            if (!type || !data) {
+                sendPacket(ws, 'ERROR', { message: "Метаданные пакета повреждены" });
+                return;
+            }
+
+            console.log(`[Request] Handling packet type: ${type}`);
+
+            switch (type) {
+                case 'REG':
+                    await handleRegister(ws, data);
+                    break;
+                case 'AUTH':
+                    await handleAuth(ws, data);
+                    break;
+                case 'ADD_FRIEND':
+                    await handleAddFriend(ws, data);
+                    break;
+                case 'GET_HISTORY':
+                    await handleGetHistory(ws, data);
+                    break;
+                case 'MSG':
+                    await handleSendMessage(ws, data);
+                    break;
+                default:
+                    sendPacket(ws, 'ERROR', { message: `Неизвестный тип пакета: ${type}` });
+            }
+        }
+
+        async function handleRegister(ws, data) {
+            let { username, password, avatar } = data;
+            if (!username || !password) {
+                sendPacket(ws, 'ERROR', { message: "Заполните все обязательные поля" });
+                return;
+            }
+
+            username = username.trim();
+            const usernameLower = username.toLowerCase();
 
             try {
-                const packet = JSON.parse(trimmed);
-                await handlePacket(ws, packet);
+                // Check existence
+                const checkRes = await pool.query('SELECT 1 FROM users WHERE LOWER(username) = $1 LIMIT 1', [usernameLower]);
+                if (checkRes.rowCount > 0) {
+                    sendPacket(ws, 'ERROR', { message: "Код ошибки 409: Пользователь с таким именем уже существует" });
+                    return;
+                }
+
+                const code = await generateUniqueCode();
+
+                // Insert user
+                await pool.query(
+                    'INSERT INTO users (username, password, code, avatar, online) VALUES ($1, $2, $3, $4, $5)',
+                                 [username, password.toLowerCase(), code, avatar || "", true]
+                );
+
+                authenticatedUserCode = code;
+                activeConnections.set(code, ws);
+
+                console.log(`[REG] Registered: ${username} with code #${code}`);
+
+                sendPacket(ws, 'AUTH_OK', { username, code });
+                await sendFriendsList(ws, code);
             } catch (err) {
-                console.error('[Connection] Error processing packet:', err.message, 'Raw line:', trimmed);
-                sendPacket(ws, 'ERROR', { message: "Неправильный формат запроса" });
+                console.error('[REG] DB failure during registration:', err.message);
+                sendPacket(ws, 'ERROR', { message: "Внутренняя ошибка сервера при генерации кода" });
             }
         }
-    });
 
-    ws.on('close', async () => {
-        console.log('[Connection] User disconnected.');
-        if (authenticatedUserCode) {
+        async function handleAuth(ws, data) {
+            let { username, password } = data;
+            if (!username || !password) {
+                sendPacket(ws, 'ERROR', { message: "Укажите имя пользователя и пароль" });
+                return;
+            }
+
+            username = username.trim();
+            const usernameLower = username.toLowerCase();
+
             try {
-                await pool.query('UPDATE users SET online = false WHERE code = $1', [authenticatedUserCode]);
-                console.log(`[Status] Offline: #${authenticatedUserCode}`);
-                activeConnections.delete(authenticatedUserCode);
-                await broadcastToFriends(authenticatedUserCode);
+                const userRes = await pool.query('SELECT username, password, code FROM users WHERE LOWER(username) = $1 LIMIT 1', [usernameLower]);
+                if (userRes.rowCount === 0) {
+                    sendPacket(ws, 'ERROR', { message: "Ошибка авторизации: Пользователь не существует" });
+                    return;
+                }
+
+                const user = userRes.rows[0];
+
+                // Verify password hashes (compare in case-insensitive lowercase)
+                if (user.password.toLowerCase() !== password.toLowerCase()) {
+                    sendPacket(ws, 'ERROR', { message: "Ошибка авторизации: Неверный логин или пароль" });
+                    return;
+                }
+
+                // Mark online
+                await pool.query('UPDATE users SET online = true WHERE code = $1', [user.code]);
+
+                authenticatedUserCode = user.code;
+                activeConnections.set(user.code, ws);
+
+                console.log(`[AUTH] Authenticated: ${user.username} (#${user.code})`);
+
+                sendPacket(ws, 'AUTH_OK', { username: user.username, code: user.code });
+                await sendFriendsList(ws, user.code);
+                await broadcastToFriends(user.code);
             } catch (err) {
-                console.error('[Connection] Error taking user offline in DB:', err.message);
+                console.error('[AUTH] DB error during auth:', err.message);
+                sendPacket(ws, 'ERROR', { message: "Ошибка сервера при авторизации" });
             }
         }
-    });
 
-    ws.on('error', (err) => {
-        console.error('[Connection] Socket error occurred:', err.message);
-    });
-
-    // Handle incoming client packet types
-    async function handlePacket(ws, packet) {
-        const { type, data } = packet;
-        if (!type || !data) {
-            sendPacket(ws, 'ERROR', { message: "Метаданные пакета повреждены" });
-            return;
-        }
-
-        console.log(`[Request] Handling packet type: ${type}`);
-
-        switch (type) {
-            case 'REG':
-                await handleRegister(ws, data);
-                break;
-            case 'AUTH':
-                await handleAuth(ws, data);
-                break;
-            case 'ADD_FRIEND':
-                await handleAddFriend(ws, data);
-                break;
-            case 'GET_HISTORY':
-                await handleGetHistory(ws, data);
-                break;
-            case 'MSG':
-                await handleSendMessage(ws, data);
-                break;
-            default:
-                sendPacket(ws, 'ERROR', { message: `Неизвестный тип пакета: ${type}` });
-        }
-    }
-
-    async function handleRegister(ws, data) {
-        let { username, password, avatar } = data;
-        if (!username || !password) {
-            sendPacket(ws, 'ERROR', { message: "Заполните все обязательные поля" });
-            return;
-        }
-
-        username = username.trim();
-        const usernameLower = username.toLowerCase();
-
-        try {
-            // Check existence
-            const checkRes = await pool.query('SELECT 1 FROM users WHERE LOWER(username) = $1 LIMIT 1', [usernameLower]);
-            if (checkRes.rowCount > 0) {
-                sendPacket(ws, 'ERROR', { message: "Код ошибки 409: Пользователь с таким именем уже существует" });
+        async function handleAddFriend(ws, data) {
+            if (!authenticatedUserCode) {
+                sendPacket(ws, 'ERROR', { message: "Сессия больше не валидна, требуется войти снова." });
                 return;
             }
 
-            const code = await generateUniqueCode();
-
-            // Insert user
-            await pool.query(
-                'INSERT INTO users (username, password, code, avatar, online) VALUES ($1, $2, $3, $4, $5)',
-                             [username, password.toLowerCase(), code, avatar || "", true]
-            );
-
-            authenticatedUserCode = code;
-            activeConnections.set(code, ws);
-
-            console.log(`[REG] Registered: ${username} with code #${code}`);
-
-            sendPacket(ws, 'AUTH_OK', { username, code });
-            await sendFriendsList(ws, code);
-        } catch (err) {
-            console.error('[REG] DB failure during registration:', err.message);
-            sendPacket(ws, 'ERROR', { message: "Внутренняя ошибка сервера при генерации кода" });
-        }
-    }
-
-    async function handleAuth(ws, data) {
-        let { username, password } = data;
-        if (!username || !password) {
-            sendPacket(ws, 'ERROR', { message: "Укажите имя пользователя и пароль" });
-            return;
-        }
-
-        username = username.trim();
-        const usernameLower = username.toLowerCase();
-
-        try {
-            const userRes = await pool.query('SELECT username, password, code FROM users WHERE LOWER(username) = $1 LIMIT 1', [usernameLower]);
-            if (userRes.rowCount === 0) {
-                sendPacket(ws, 'ERROR', { message: "Ошибка авторизации: Пользователь не существует" });
+            const { code } = data;
+            if (!code) {
+                sendPacket(ws, 'ERROR', { message: "Введите корректный код потенциального собеседника." });
                 return;
             }
 
-            const user = userRes.rows[0];
-
-            // Verify password hashes (compare in case-insensitive lowercase)
-            if (user.password.toLowerCase() !== password.toLowerCase()) {
-                sendPacket(ws, 'ERROR', { message: "Ошибка авторизации: Неверный логин или пароль" });
+            if (code === authenticatedUserCode) {
+                sendPacket(ws, 'ERROR', { message: "Вы не можете добавить свой собственный код." });
                 return;
             }
 
-            // Mark online
-            await pool.query('UPDATE users SET online = true WHERE code = $1', [user.code]);
+            try {
+                // Find target
+                const targetRes = await pool.query('SELECT username FROM users WHERE code = $1 LIMIT 1', [code]);
+                if (targetRes.rowCount === 0) {
+                    sendPacket(ws, 'ERROR', { message: "Пользователь со специальным кодом #" + code + " не найден в базе." });
+                    return;
+                }
 
-            authenticatedUserCode = user.code;
-            activeConnections.set(user.code, ws);
-
-            console.log(`[AUTH] Authenticated: ${user.username} (#${user.code})`);
-
-            sendPacket(ws, 'AUTH_OK', { username: user.username, code: user.code });
-            await sendFriendsList(ws, user.code);
-            await broadcastToFriends(user.code);
-        } catch (err) {
-            console.error('[AUTH] DB error during auth:', err.message);
-            sendPacket(ws, 'ERROR', { message: "Ошибка сервера при авторизации" });
-        }
-    }
-
-    async function handleAddFriend(ws, data) {
-        if (!authenticatedUserCode) {
-            sendPacket(ws, 'ERROR', { message: "Сессия больше не валидна, требуется войти снова." });
-            return;
-        }
-
-        const { code } = data;
-        if (!code) {
-            sendPacket(ws, 'ERROR', { message: "Введите корректный код потенциального собеседника." });
-            return;
-        }
-
-        if (code === authenticatedUserCode) {
-            sendPacket(ws, 'ERROR', { message: "Вы не можете добавить свой собственный код." });
-            return;
-        }
-
-        try {
-            // Find target
-            const targetRes = await pool.query('SELECT username FROM users WHERE code = $1 LIMIT 1', [code]);
-            if (targetRes.rowCount === 0) {
-                sendPacket(ws, 'ERROR', { message: "Пользователь со специальным кодом #" + code + " не найден в базе." });
-                return;
-            }
-
-            // Check if already friends
-            const existsRes = await pool.query(
-                'SELECT 1 FROM friendships WHERE user_code = $1 AND friend_code = $2 LIMIT 1',
-                [authenticatedUserCode, code]
-            );
-            if (existsRes.rowCount > 0) {
-                sendPacket(ws, 'ERROR', { message: "Пользователь уже находится в вашем списке чатов." });
-                return;
-            }
-
-            // Commit friendship relation mutually
-            await pool.query('INSERT INTO friendships (user_code, friend_code) VALUES ($1, $2)', [authenticatedUserCode, code]);
-            await pool.query('INSERT INTO friendships (user_code, friend_code) VALUES ($1, $2)', [code, authenticatedUserCode]);
-
-            console.log(`[Friendship] Added link between #${authenticatedUserCode} and #${code}`);
-
-            // Direct instant update
-            await sendFriendsList(ws, authenticatedUserCode);
-
-            const friendWs = activeConnections.get(code);
-            if (friendWs && friendWs.readyState === WebSocket.OPEN) {
-                await sendFriendsList(friendWs, code);
-            }
-        } catch (err) {
-            console.error('[AddFriend] DB transaction failure:', err.message);
-            sendPacket(ws, 'ERROR', { message: "Произошла ошибка при установлении контакта." });
-        }
-    }
-
-    async function handleGetHistory(ws, data) {
-        if (!authenticatedUserCode) {
-            sendPacket(ws, 'ERROR', { message: "Требуется авторизация" });
-            return;
-        }
-
-        const { room } = data;
-        if (!room) {
-            sendPacket(ws, 'ERROR', { message: "Комната не указана" });
-            return;
-        }
-
-        console.log(`[History] Fetching history for ${room}`);
-
-        try {
-            let historyRes;
-            if (room === 'GLOBAL') {
-                historyRes = await pool.query(
-                    'SELECT sender, text, time FROM messages WHERE room = $1 ORDER BY timestamp ASC',
-                    ['GLOBAL']
+                // Check if already friends
+                const existsRes = await pool.query(
+                    'SELECT 1 FROM friendships WHERE user_code = $1 AND friend_code = $2 LIMIT 1',
+                    [authenticatedUserCode, code]
                 );
-            } else {
-                // Return messages between matching room code & authenticated sender code
-                historyRes = await pool.query(
-                    `SELECT sender, text, time FROM messages
-                    WHERE (room = $1 AND sender_code = $2)
-                    OR (room = $2 AND sender_code = $1)
-                    ORDER BY timestamp ASC`,
-                    [room, authenticatedUserCode]
-                );
+                if (existsRes.rowCount > 0) {
+                    sendPacket(ws, 'ERROR', { message: "Пользователь уже находится в вашем списке чатов." });
+                    return;
+                }
+
+                // Commit friendship relation mutually
+                await pool.query('INSERT INTO friendships (user_code, friend_code) VALUES ($1, $2)', [authenticatedUserCode, code]);
+                await pool.query('INSERT INTO friendships (user_code, friend_code) VALUES ($1, $2)', [code, authenticatedUserCode]);
+
+                console.log(`[Friendship] Added link between #${authenticatedUserCode} and #${code}`);
+
+                // Direct instant update
+                await sendFriendsList(ws, authenticatedUserCode);
+
+                const friendWs = activeConnections.get(code);
+                if (friendWs && friendWs.readyState === WebSocket.OPEN) {
+                    await sendFriendsList(friendWs, code);
+                }
+            } catch (err) {
+                console.error('[AddFriend] DB transaction failure:', err.message);
+                sendPacket(ws, 'ERROR', { message: "Произошла ошибка при установлении контакта." });
+            }
+        }
+
+        async function handleGetHistory(ws, data) {
+            if (!authenticatedUserCode) {
+                sendPacket(ws, 'ERROR', { message: "Требуется авторизация" });
+                return;
             }
 
-            const historyList = historyRes.rows.map(row => ({
-                sender: row.sender,
-                text: row.text,
-                time: row.time
-            }));
+            const { room } = data;
+            if (!room) {
+                sendPacket(ws, 'ERROR', { message: "Комната не указана" });
+                return;
+            }
 
-            sendPacket(ws, 'MSG_HISTORY', { room, history: historyList });
-        } catch (err) {
-            console.error('[History] DB select failure:', err.message);
-            sendPacket(ws, 'ERROR', { message: "Не удалось загрузить историю чата" });
+            console.log(`[History] Fetching history for ${room}`);
+
+            try {
+                let historyRes;
+                if (room === 'GLOBAL') {
+                    historyRes = await pool.query(
+                        'SELECT sender, text, time FROM messages WHERE room = $1 ORDER BY timestamp ASC',
+                        ['GLOBAL']
+                    );
+                } else {
+                    // Return messages between matching room code & authenticated sender code
+                    historyRes = await pool.query(
+                        `SELECT sender, text, time FROM messages
+                        WHERE (room = $1 AND sender_code = $2)
+                        OR (room = $2 AND sender_code = $1)
+                        ORDER BY timestamp ASC`,
+                        [room, authenticatedUserCode]
+                    );
+                }
+
+                const historyList = historyRes.rows.map(row => ({
+                    sender: row.sender,
+                    text: row.text,
+                    time: row.time
+                }));
+
+                sendPacket(ws, 'MSG_HISTORY', { room, history: historyList });
+            } catch (err) {
+                console.error('[History] DB select failure:', err.message);
+                sendPacket(ws, 'ERROR', { message: "Не удалось загрузить историю чата" });
+            }
         }
-    }
 
-    async function handleSendMessage(ws, data) {
-        if (!authenticatedUserCode) {
-            sendPacket(ws, 'ERROR', { message: "Ошибка отправки: Сессия не авторизована." });
-            return;
-        }
+        async function handleSendMessage(ws, data) {
+            if (!authenticatedUserCode) {
+                sendPacket(ws, 'ERROR', { message: "Ошибка отправки: Сессия не авторизована." });
+                return;
+            }
 
-        const { to, text } = data;
-        if (!to || !text || !text.trim()) {
-            return;
-        }
+            const { to, text } = data;
+            if (!to || !text || !text.trim()) {
+                return;
+            }
 
-        try {
-            const senderUsername = await getUsernameByCode(authenticatedUserCode);
-            const now = new Date();
-            const timeStr = now.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+            try {
+                const senderUsername = await getUsernameByCode(authenticatedUserCode);
+                const now = new Date();
+                const timeStr = now.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 
-            // Record into db
-            await pool.query(
-                'INSERT INTO messages (room, sender, sender_code, text, time, timestamp) VALUES ($1, $2, $3, $4, $5, $6)',
-                             [to, senderUsername, authenticatedUserCode, text, timeStr, now.getTime()]
-            );
+                // Record into db
+                await pool.query(
+                    'INSERT INTO messages (room, sender, sender_code, text, time, timestamp) VALUES ($1, $2, $3, $4, $5, $6)',
+                                 [to, senderUsername, authenticatedUserCode, text, timeStr, now.getTime()]
+                );
 
-            if (to === 'GLOBAL') {
-                wss.clients.forEach(client => {
-                    if (client.readyState === WebSocket.OPEN) {
-                        sendPacket(client, 'MSG', {
-                            from: 'GLOBAL',
+                if (to === 'GLOBAL') {
+                    wss.clients.forEach(client => {
+                        if (client.readyState === WebSocket.OPEN) {
+                            sendPacket(client, 'MSG', {
+                                from: 'GLOBAL',
+                                senderName: senderUsername,
+                                text: text
+                            });
+                        }
+                    });
+                } else {
+                    // Private message
+                    const targetCompanionWs = activeConnections.get(to);
+                    if (targetCompanionWs && targetCompanionWs.readyState === WebSocket.OPEN) {
+                        sendPacket(targetCompanionWs, 'MSG', {
+                            from: authenticatedUserCode,
                             senderName: senderUsername,
                             text: text
                         });
                     }
-                });
-            } else {
-                // Private message
-                const targetCompanionWs = activeConnections.get(to);
-                if (targetCompanionWs && targetCompanionWs.readyState === WebSocket.OPEN) {
-                    sendPacket(targetCompanionWs, 'MSG', {
-                        from: authenticatedUserCode,
+
+                    // Send back to current client so it displays immediately
+                    sendPacket(ws, 'MSG', {
+                        from: to,
                         senderName: senderUsername,
                         text: text
                     });
                 }
-
-                // Send back to current client so it displays immediately
-                sendPacket(ws, 'MSG', {
-                    from: to,
-                    senderName: senderUsername,
-                    text: text
-                });
+            } catch (err) {
+                console.error('[MSG] DB write failure on sending message:', err.message);
             }
-        } catch (err) {
-            console.error('[MSG] DB write failure on sending message:', err.message);
         }
-    }
+    });
+}).catch(err => {
+    console.error("[CRITICAL] Could not initialize database schema:", err.message);
+    process.exit(1);
 });
 
 // Helper: send serial message
@@ -477,5 +454,32 @@ async function broadcastToFriends(userCode) {
         }
     } catch (err) {
         console.error('[Broadcast] Failure notifying list to companions:', err.message);
+    }
+}
+
+// Helper: Generate a random unique 4-digit code (e.g. "4921")
+async function generateUniqueCode() {
+    let attempt = 0;
+    while (attempt < 10000) {
+        const num = Math.floor(Math.random() * 10000);
+        const codeStr = String(num).padStart(4, '0');
+
+        // Check uniqueness in DB
+        const res = await pool.query('SELECT 1 FROM users WHERE code = $1 LIMIT 1', [codeStr]);
+        if (res.rowCount === 0) {
+            return codeStr;
+        }
+        attempt++;
+    }
+    throw new Error("Unable to generate unique 4-digit code. Range exceeded.");
+}
+
+// Helper: Get username safely by code
+async function getUsernameByCode(code) {
+    try {
+        const res = await pool.query('SELECT username FROM users WHERE code = $1 LIMIT 1', [code]);
+        return res.rows[0] ? res.rows[0].username : "Пользователь";
+    } catch (err) {
+        return "Пользователь";
     }
 }
