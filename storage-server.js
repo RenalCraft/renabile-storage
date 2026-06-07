@@ -39,16 +39,28 @@ async function initDatabase() {
         // Live migrations for Users table (safe if columns already exist)
         try {
             await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS password VARCHAR(255);');
-            await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS code VARCHAR(4);');
-            await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;');
-            await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS online BOOLEAN DEFAULT FALSE;');
-            try {
-                await pool.query('ALTER TABLE users ADD CONSTRAINT unique_code_node UNIQUE (code);');
-            } catch (err) {}
-            console.log('[DB] Users table live migrations validated.');
         } catch (err) {
-            console.log('[DB Migration Warning] Users table migrations ignored or already applied:', err.message);
+            console.log('[DB Migration password warning] Ignored or already applied:', err.message);
         }
+        try {
+            await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS code VARCHAR(4);');
+        } catch (err) {
+            console.log('[DB Migration code warning] Ignored or already applied:', err.message);
+        }
+        try {
+            await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;');
+        } catch (err) {
+            console.log('[DB Migration avatar warning] Ignored or already applied:', err.message);
+        }
+        try {
+            await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS online BOOLEAN DEFAULT FALSE;');
+        } catch (err) {
+            console.log('[DB Migration online warning] Ignored or already applied:', err.message);
+        }
+        try {
+            await pool.query('ALTER TABLE users ADD CONSTRAINT unique_code_node UNIQUE (code);');
+        } catch (err) {}
+        console.log('[DB] Users table live migrations validated.');
 
         await pool.query(`
         CREATE TABLE IF NOT EXISTS friendships (
