@@ -63,6 +63,11 @@ async function initDatabase() {
             console.log('[DB Migration online warning] Ignored or already applied:', err.message);
         }
         try {
+            await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen BIGINT DEFAULT 0;');
+        } catch (err) {
+            console.log('[DB Migration last_seen warning] Ignored or already applied:', err.message);
+        }
+        try {
             await pool.query('ALTER TABLE users ADD CONSTRAINT unique_code_node UNIQUE (code);');
         } catch (err) {}
         console.log('[DB] Users table live migrations validated.');
@@ -195,7 +200,7 @@ initDatabase().then(() => {
             console.log('[Connection] User disconnected.');
             if (authenticatedUserCode) {
                 try {
-                    await pool.query('UPDATE users SET online = false WHERE code = $1', [authenticatedUserCode]);
+                    await pool.query('UPDATE users SET online = false, last_seen = $1 WHERE code = $2', [Date.now(), authenticatedUserCode]);
                     console.log(`[Status] Offline: #${authenticatedUserCode}`);
                     activeConnections.delete(authenticatedUserCode);
                     await broadcastToFriends(authenticatedUserCode);
@@ -240,6 +245,9 @@ initDatabase().then(() => {
                     break;
                 case 'MSG_UPDATE':
                     await handleMsgUpdate(ws, data);
+                    break;
+                case 'CLEAR_HISTORY':
+                    await handleClearHistory(ws, data);
                     break;
                 default:
                     sendPacket(ws, 'ERROR', { message: `Неизвестный тип пакета: ${type}` });
@@ -430,6 +438,45 @@ initDatabase().then(() => {
             }
         }
 
+        async function handleClearHistory(ws, data) {
+            if (!authenticatedUserCode) {
+                sendPacket(ws, 'ERROR', { message: "Требуется авторизация" });
+                return;
+            }
+
+            const { room } = data;
+            if (!room) {
+                sendPacket(ws, 'ERROR', { message: "Комната не указана" });
+                return;
+            }
+
+            console.log(`[Clear] Clearing history for room ${room} requested by #${authenticatedUserCode}`);
+            try {
+                if (room === 'GLOBAL') {
+                    await pool.query('DELETE FROM messages WHERE room = $1', ['GLOBAL']);
+                } else {
+                    await pool.query(
+                        `DELETE FROM messages
+                        WHERE (room = $1 AND sender_code = $2)
+                        OR (room = $2 AND sender_code = $1)`,
+                                     [room, authenticatedUserCode]
+                    );
+                }
+
+                sendPacket(ws, 'MSG_HISTORY', { room, history: [] });
+
+                const otherWs = activeConnections.get(room);
+                if (otherWs && otherWs.readyState === WebSocket.OPEN) {
+                    sendPacket(otherWs, 'MSG_HISTORY', { room: authenticatedUserCode, history: [] });
+                }
+
+                console.log(`[Clear] History successfully cleared for room ${room}`);
+            } catch (err) {
+                console.error('[Clear] Database deletion failure:', err.message);
+                sendPacket(ws, 'ERROR', { message: "Не удалось очистить историю" });
+            }
+        }
+
         async function handleSendMessage(ws, data) {
             if (!authenticatedUserCode) {
                 sendPacket(ws, 'ERROR', { message: "Ошибка отправки: Сессия не авторизована." });
@@ -594,7 +641,7 @@ function sendPacket(ws, type, data) {
 async function sendFriendsList(ws, userCode) {
     try {
         const query = `
-        SELECT u.username, u.code, u.online, u.avatar
+        SELECT u.username, u.code, u.online, u.avatar, u.last_seen
         FROM friendships f
         JOIN users u ON f.friend_code = u.code
         WHERE f.user_code = $1
@@ -605,7 +652,8 @@ async function sendFriendsList(ws, userCode) {
             username: row.username,
             code: row.code,
             online: row.online,
-            avatar: row.avatar || ""
+            avatar: row.avatar || "",
+            last_seen: row.last_seen ? Number(row.last_seen) : 0
         }));
 
         sendPacket(ws, 'FRIENDS_LIST', { list });
