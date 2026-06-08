@@ -399,13 +399,13 @@ initDatabase().then(() => {
                 let historyRes;
                 if (room === 'GLOBAL') {
                     historyRes = await pool.query(
-                        'SELECT sender, text, time FROM messages WHERE room = $1 ORDER BY timestamp ASC',
+                        'SELECT sender, text, time, client_msg_id, reaction, is_edited, is_deleted FROM messages WHERE room = $1 ORDER BY timestamp ASC',
                         ['GLOBAL']
                     );
                 } else {
                     // Return messages between matching room code & authenticated sender code
                     historyRes = await pool.query(
-                        `SELECT sender, text, time FROM messages
+                        `SELECT sender, text, time, client_msg_id, reaction, is_edited, is_deleted FROM messages
                         WHERE (room = $1 AND sender_code = $2)
                         OR (room = $2 AND sender_code = $1)
                         ORDER BY timestamp ASC`,
@@ -416,7 +416,11 @@ initDatabase().then(() => {
                 const historyList = historyRes.rows.map(row => ({
                     sender: row.sender,
                     text: row.text,
-                    time: row.time
+                    time: row.time,
+                    client_msg_id: row.client_msg_id || "",
+                    reaction: row.reaction || "",
+                    is_edited: !!row.is_edited,
+                    is_deleted: !!row.is_deleted
                 }));
 
                 sendPacket(ws, 'MSG_HISTORY', { room, history: historyList });
