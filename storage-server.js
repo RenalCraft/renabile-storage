@@ -234,6 +234,22 @@ initDatabase().then(() => {
     wss = new WebSocketServer({ port: PORT });
     console.log(`[RenaBile Server] WebSocket Listening on port ${PORT}`);
 
+    // Automatic clean up: Delete message attachments older than 14 days
+    setInterval(async () => {
+        try {
+            const twoWeeksAgo = Date.now() - (14 * 24 * 60 * 60 * 1000);
+            const deleteRes = await pool.query(
+                "DELETE FROM messages WHERE text LIKE '[IMAGE]:%' AND timestamp < $1",
+                [twoWeeksAgo]
+            );
+            if (deleteRes.rowCount > 0) {
+                console.log(`[DB Clean] Auto-deleted ${deleteRes.rowCount} photo attachments older than 14 days.`);
+            }
+        } catch (err) {
+            console.error('[DB Clean Error] Failed to run automatic retention cleanup:', err.message);
+        }
+    }, 6 * 60 * 60 * 1000); // Executed every 6 hours
+
     wss.on('connection', (ws, req) => {
         let authenticatedUserCode = null;
         const clientIp = getClientIp(ws, req);
