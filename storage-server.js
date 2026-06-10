@@ -657,29 +657,31 @@ initDatabase().then(() => {
                 return;
             }
 
-            const { username, password, avatar } = data;
+            const { username, password, avatar, wakeupEnabled } = data;
             if (!username || !username.trim()) {
                 sendPacket(ws, 'ERROR', { message: "Имя не может быть пустым." });
                 return;
             }
 
+            const parsedWakeup = wakeupEnabled !== undefined ? !!wakeupEnabled : false;
+
             try {
                 if (password && password.trim()) {
                     await pool.query(
-                        'UPDATE users SET username = $1, password = $2, avatar = $3 WHERE code = $4',
-                        [username.trim(), password.trim().toLowerCase(), avatar || "", authenticatedUserCode]
+                        'UPDATE users SET username = $1, password = $2, avatar = $3, wakeup_enabled = $4 WHERE code = $5',
+                        [username.trim(), password.trim().toLowerCase(), avatar || "", parsedWakeup, authenticatedUserCode]
                     );
                 } else {
                     await pool.query(
-                        'UPDATE users SET username = $1, avatar = $2 WHERE code = $3',
-                        [username.trim(), avatar || "", authenticatedUserCode]
+                        'UPDATE users SET username = $1, avatar = $2, wakeup_enabled = $3 WHERE code = $4',
+                        [username.trim(), avatar || "", parsedWakeup, authenticatedUserCode]
                     );
                 }
 
-                console.log(`[Profile Update] Code #${authenticatedUserCode} updated to ${username}`);
+                console.log(`[Profile Update] Code #${authenticatedUserCode} updated to ${username} (Wakeup: ${parsedWakeup})`);
 
                 // Send success confirmation packet
-                sendPacket(ws, 'AUTH_OK', { username: username.trim(), code: authenticatedUserCode, avatar: avatar || "" });
+                sendPacket(ws, 'AUTH_OK', { username: username.trim(), code: authenticatedUserCode, avatar: avatar || "", wakeupEnabled: parsedWakeup });
 
                 // Refresh lists
                 await sendFriendsList(ws, authenticatedUserCode);
