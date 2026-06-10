@@ -522,10 +522,17 @@ initDatabase().then(() => {
                         'SELECT sender, text, time, client_msg_id, reaction, is_edited, is_deleted FROM messages WHERE room = $1 ORDER BY timestamp ASC',
                         ['GLOBAL']
                     );
+                } else if (room.startsWith('group_')) {
+                    historyRes = await pool.query(
+                        `SELECT sender, sender_code, text, time, client_msg_id, reaction, is_edited, is_deleted FROM messages
+                        WHERE room = $1
+                        ORDER BY timestamp ASC`,
+                        [room]
+                    );
                 } else {
                     // Return messages between matching room code & authenticated sender code
                     historyRes = await pool.query(
-                        `SELECT sender, text, time, client_msg_id, reaction, is_edited, is_deleted FROM messages
+                        `SELECT sender, sender_code, text, time, client_msg_id, reaction, is_edited, is_deleted FROM messages
                         WHERE (room = $1 AND sender_code = $2)
                         OR (room = $2 AND sender_code = $1)
                         ORDER BY timestamp ASC`,
@@ -616,6 +623,36 @@ initDatabase().then(() => {
                                 clientMsgId: clientMsgId || ""
                             });
                         }
+                    });
+                } else if (to.startsWith('group_')) {
+                    // Group message broadcast
+                    const gRes = await pool.query('SELECT members FROM groups WHERE id = $1 LIMIT 1', [to]);
+                    if (gRes.rowCount > 0) {
+                        const members = typeof gRes.rows[0].members === 'string'
+                        ? JSON.parse(gRes.rows[0].members)
+                        : gRes.rows[0].members;
+                        if (Array.isArray(members)) {
+                            members.forEach(memberCode => {
+                                if (memberCode !== authenticatedUserCode) {
+                                    const memberWs = activeConnections.get(memberCode);
+                                    if (memberWs && memberWs.readyState === WebSocket.OPEN) {
+                                        sendPacket(memberWs, 'MSG', {
+                                            from: to,
+                                            senderName: senderUsername,
+                                            text: text,
+                                            clientMsgId: clientMsgId || ""
+                                        });
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    // Send back to current client so it displays immediately
+                    sendPacket(ws, 'MSG', {
+                        from: to,
+                        senderName: senderUsername,
+                        text: text,
+                        clientMsgId: clientMsgId || ""
                     });
                 } else {
                     // Private message
@@ -751,6 +788,31 @@ function sendPacket(ws, type, data) {
     ws.send(packet);
 }
 
+async function sendGroupsList(ws, userCode) {
+    try {
+        const res = await pool.query('SELECT id, name, avatar, creator_code, members FROM groups');
+        const list = [];
+        res.rows.forEach(row => {
+            let membersArray = [];
+            try {
+                membersArray = JSON.parse(row.members);
+            } catch (e) {}
+            if (Array.isArray(membersArray) && membersArray.includes(userCode)) {
+                list.push({
+                    id: row.id,
+                    name: row.name,
+                    avatar: row.avatar || "",
+                    creatorCode: row.creator_code,
+                    members: membersArray
+                });
+            }
+        });
+        sendPacket(ws, 'GROUPS_LIST', { list });
+    } catch (err) {
+        console.error('[Groups] Get list error:', err.message);
+    }
+}
+
 // Helper: Send updated lists to user
 async function sendFriendsList(ws, userCode) {
     try {
@@ -771,6 +833,7 @@ async function sendFriendsList(ws, userCode) {
         }));
 
         sendPacket(ws, 'FRIENDS_LIST', { list });
+        await sendGroupsList(ws, userCode);
     } catch (err) {
         console.error('[Friends] Get list error:', err.message);
     }
@@ -949,6 +1012,7 @@ async function handleCreateGroup(ws, data) {
             const memberWs = activeConnections.get(code);
             if (memberWs && memberWs.readyState === WebSocket.OPEN) {
                 sendPacket(memberWs, 'GROUP_CREATED', groupPayload);
+                await sendGroupsList(memberWs, code);
             }
         }
     } catch (err) {
