@@ -203,6 +203,12 @@ async function initDatabase() {
         try {
             await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE;');
         } catch (err) {}
+        try {
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE;');
+        } catch (err) {}
+        try {
+            await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_time BIGINT DEFAULT 0;');
+        } catch (err) {}
 
         // Mark everyone offline initially on server restart
         await pool.query('UPDATE users SET online = false;');
@@ -311,6 +317,12 @@ initDatabase().then(() => {
                     break;
                 case 'ADD_FRIEND':
                     await handleAddFriend(ws, data);
+                    break;
+                case 'REMOVE_FRIEND':
+                    await handleRemoveFriend(ws, data);
+                    break;
+                case 'MARK_READ':
+                    await handleMarkRead(ws, data);
                     break;
                 case 'GET_HISTORY':
                     await handleGetHistory(ws, data);
@@ -501,6 +513,51 @@ initDatabase().then(() => {
             }
         }
 
+        async function handleRemoveFriend(ws, data) {
+            if (!authenticatedUserCode) {
+                sendPacket(ws, 'ERROR', { message: "Сессия больше не валидна." });
+                return;
+            }
+            const { code } = data;
+            if (!code) return;
+            try {
+                await pool.query(
+                    'DELETE FROM friendships WHERE (user_code = $1 AND friend_code = $2) OR (user_code = $2 AND friend_code = $1)',
+                                 [authenticatedUserCode, code]
+                );
+                console.log(`[Friendship] Removed link between #${authenticatedUserCode} and #${code}`);
+                await sendFriendsList(ws, authenticatedUserCode);
+                const friendWs = activeConnections.get(code);
+                if (friendWs && friendWs.readyState === WebSocket.OPEN) {
+                    await sendFriendsList(friendWs, code);
+                }
+            } catch (err) {
+                console.error('[RemoveFriend] DB error:', err.message);
+                sendPacket(ws, 'ERROR', { message: "Ошибка при удалении контакта." });
+            }
+        }
+
+        async function handleMarkRead(ws, data) {
+            if (!authenticatedUserCode) return;
+            const { room } = data;
+            if (!room) return;
+            try {
+                await pool.query(
+                    'UPDATE messages SET is_read = true, read_time = $1 WHERE room = $2 AND sender_code = $3 AND is_read = false',
+                    [Date.now(), authenticatedUserCode, room]
+                );
+                const companionWs = activeConnections.get(room);
+                if (companionWs && companionWs.readyState === WebSocket.OPEN) {
+                    sendPacket(companionWs, 'READ_RECEIPT', {
+                        room: authenticatedUserCode,
+                        time: Date.now()
+                    });
+                }
+            } catch (err) {
+                console.error('[MarkRead] Async DB write failure:', err.message);
+            }
+        }
+
         async function handleGetHistory(ws, data) {
             if (!authenticatedUserCode) {
                 sendPacket(ws, 'ERROR', { message: "Требуется авторизация" });
@@ -516,15 +573,30 @@ initDatabase().then(() => {
             console.log(`[History] Fetching history for ${room}`);
 
             try {
+                if (room !== 'GLOBAL' && !room.startsWith('group_')) {
+                    // Mark messages sent by companion to us as read
+                    await pool.query(
+                        'UPDATE messages SET is_read = true, read_time = $1 WHERE room = $2 AND sender_code = $3 AND is_read = false',
+                        [Date.now(), authenticatedUserCode, room]
+                    );
+                    const companionWs = activeConnections.get(room);
+                    if (companionWs && companionWs.readyState === WebSocket.OPEN) {
+                        sendPacket(companionWs, 'READ_RECEIPT', {
+                            room: authenticatedUserCode,
+                            time: Date.now()
+                        });
+                    }
+                }
+
                 let historyRes;
                 if (room === 'GLOBAL') {
                     historyRes = await pool.query(
-                        'SELECT sender, text, time, client_msg_id, reaction, is_edited, is_deleted FROM messages WHERE room = $1 ORDER BY timestamp ASC',
+                        'SELECT sender, text, time, client_msg_id, reaction, is_edited, is_deleted, is_read, read_time, sender_code FROM messages WHERE room = $1 ORDER BY timestamp ASC',
                         ['GLOBAL']
                     );
                 } else if (room.startsWith('group_')) {
                     historyRes = await pool.query(
-                        `SELECT sender, sender_code, text, time, client_msg_id, reaction, is_edited, is_deleted FROM messages
+                        `SELECT sender, sender_code, text, time, client_msg_id, reaction, is_edited, is_deleted, is_read, read_time FROM messages
                         WHERE room = $1
                         ORDER BY timestamp ASC`,
                         [room]
@@ -532,7 +604,7 @@ initDatabase().then(() => {
                 } else {
                     // Return messages between matching room code & authenticated sender code
                     historyRes = await pool.query(
-                        `SELECT sender, sender_code, text, time, client_msg_id, reaction, is_edited, is_deleted FROM messages
+                        `SELECT sender, sender_code, text, time, client_msg_id, reaction, is_edited, is_deleted, is_read, read_time FROM messages
                         WHERE (room = $1 AND sender_code = $2)
                         OR (room = $2 AND sender_code = $1)
                         ORDER BY timestamp ASC`,
@@ -542,12 +614,15 @@ initDatabase().then(() => {
 
                 const historyList = historyRes.rows.map(row => ({
                     sender: row.sender,
+                    sender_code: row.sender_code || "",
                     text: row.text,
                     time: row.time,
                     client_msg_id: row.client_msg_id || "",
                     reaction: row.reaction || "",
                     is_edited: !!row.is_edited,
-                    is_deleted: !!row.is_deleted
+                    is_deleted: !!row.is_deleted,
+                    is_read: !!row.is_read,
+                    read_time: row.read_time ? Number(row.read_time) : 0
                 }));
 
                 sendPacket(ws, 'MSG_HISTORY', { room, history: historyList });
